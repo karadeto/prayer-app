@@ -407,6 +407,7 @@ struct PrayerStatus {
     let currentPrayer: Prayer?
     let nextPrayer: Prayer?
     let timeUntilNext: TimeInterval
+    let timeUntilCurrentEnds: TimeInterval
     let allPrayers: [Prayer]
     
     /// Validates that the prayer status is consistent

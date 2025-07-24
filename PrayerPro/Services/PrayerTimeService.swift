@@ -29,10 +29,14 @@ class PrayerTimeService {
         // Check cache first
         if let cachedPrayers = try cacheManager.getCachedDailyPrayers(for: location.id, date: today, in: context) {
             print("Using cached daily prayer times for \(location.displayName)")
-            self.cachedPrayers = cachedPrayers
-            self.lastFetchDate = today
-            self.lastFetchLocation = location
-            return cachedPrayers
+            await MainActor.run {
+                self.cachedPrayers = cachedPrayers
+                self.lastFetchDate = today
+                self.lastFetchLocation = location
+            }
+            
+            // Sync completion states with existing records
+            return try await syncPrayerCompletionStates(cachedPrayers, in: context)
         }
         
         // Fetch from API if not cached or expired
@@ -54,12 +58,16 @@ class PrayerTimeService {
             try cacheManager.cacheDailyPrayers(prayers, for: location.id, date: today, in: context)
             
             // Update in-memory cache
-            cachedPrayers = prayers
-            lastFetchDate = today
-            lastFetchLocation = location
+            await MainActor.run {
+                cachedPrayers = prayers
+                lastFetchDate = today
+                lastFetchLocation = location
+            }
             
             print("Fetched and cached daily prayer times for \(location.displayName)")
-            return prayers
+            
+            // Sync completion states with existing records
+            return try await syncPrayerCompletionStates(prayers, in: context)
         } catch {
             print("Failed to fetch daily prayer times: \(error.localizedDescription)")
             throw error
@@ -73,7 +81,9 @@ class PrayerTimeService {
         // Check cache first
         if let cachedPrayers = try cacheManager.getCachedAnnualPrayers(for: location.id, year: currentYear, in: context) {
             print("Using cached annual prayer times for \(location.displayName)")
-            return cachedPrayers
+            
+            // Sync completion states with existing records
+            return try await syncPrayerCompletionStates(cachedPrayers, in: context)
         }
         
         // Fetch from API if not cached or expired
@@ -94,7 +104,9 @@ class PrayerTimeService {
             try cacheManager.cacheAnnualPrayers(prayers, for: location.id, year: currentYear, in: context)
             
             print("Fetched and cached annual prayer times for \(location.displayName)")
-            return prayers
+            
+            // Sync completion states with existing records
+            return try await syncPrayerCompletionStates(prayers, in: context)
         } catch {
             print("Failed to fetch annual prayer times: \(error.localizedDescription)")
             throw error
@@ -150,20 +162,34 @@ class PrayerTimeService {
         }
         
         guard !todaysPrayers.isEmpty else {
-            return PrayerStatus(currentPrayer: nil, nextPrayer: nil, timeUntilNext: 0, allPrayers: [])
+            return PrayerStatus(currentPrayer: nil, nextPrayer: nil, timeUntilNext: 0, timeUntilCurrentEnds: 0, allPrayers: [])
         }
         
         let sortedPrayers = todaysPrayers.sorted { $0.time < $1.time }
         
         // Find current and next prayer with improved logic
-        let (currentPrayer, nextPrayer) = findCurrentAndNextPrayer(from: sortedPrayers, at: now)
+        let (currentPrayer, nextPrayer) = await findCurrentAndNextPrayer(from: sortedPrayers, at: now, location: location, context: context)
         
-        let timeUntilNext = nextPrayer?.time.timeIntervalSince(now) ?? 0
+        var timeUntilNext: TimeInterval = 0
+        var timeUntilCurrentEnds: TimeInterval = 0
+        
+        if let nextPrayer = nextPrayer {
+            timeUntilNext = max(0, nextPrayer.time.timeIntervalSince(now))
+            timeUntilCurrentEnds = timeUntilNext
+        } else if let currentPrayer = currentPrayer, currentPrayer.prayerType == .isha {
+            // For Isha, calculate time until tomorrow's Fajr for countdown, but don't set nextPrayer
+            if let todaysFajr = sortedPrayers.first(where: { $0.prayerType == .fajr }) {
+                let tomorrowFajrTime = Calendar.current.date(byAdding: .day, value: 1, to: todaysFajr.time) ?? todaysFajr.time
+                timeUntilNext = max(0, tomorrowFajrTime.timeIntervalSince(now))
+                timeUntilCurrentEnds = timeUntilNext
+            }
+        }
         
         return PrayerStatus(
             currentPrayer: currentPrayer,
             nextPrayer: nextPrayer,
-            timeUntilNext: max(0, timeUntilNext),
+            timeUntilNext: timeUntilNext,
+            timeUntilCurrentEnds: timeUntilCurrentEnds,
             allPrayers: sortedPrayers
         )
     }
@@ -209,7 +235,7 @@ class PrayerTimeService {
     // MARK: - Prayer Time Calculations
     
     /// Find current and next prayer from sorted prayer list
-    private func findCurrentAndNextPrayer(from sortedPrayers: [Prayer], at currentTime: Date) -> (current: Prayer?, next: Prayer?) {
+    private func findCurrentAndNextPrayer(from sortedPrayers: [Prayer], at currentTime: Date, location: Location?, context: ModelContext?) async -> (current: Prayer?, next: Prayer?) {
         var currentPrayer: Prayer?
         var nextPrayer: Prayer?
         
@@ -225,8 +251,28 @@ class PrayerTimeService {
             }
         }
         
-        // If no next prayer found for today, next would be Fajr of tomorrow
-        // For now, we'll leave it as nil - this could be enhanced to fetch tomorrow's Fajr
+        // For single-day view, don't create cross-day prayers
+        // This prevents showing tomorrow's Fajr in today's view
+        
+        return (currentPrayer, nextPrayer)
+    }
+    
+    /// Find current and next prayer from sorted prayer list (synchronous version)
+    private func findCurrentAndNextPrayerSync(from sortedPrayers: [Prayer], at currentTime: Date) -> (current: Prayer?, next: Prayer?) {
+        var currentPrayer: Prayer?
+        var nextPrayer: Prayer?
+        
+        // Filter out sunrise as it's not a prayer time for notifications
+        let prayerTimes = sortedPrayers.filter { $0.prayerType != .sunrise }
+        
+        for (_, prayer) in prayerTimes.enumerated() {
+            if prayer.time <= currentTime {
+                currentPrayer = prayer
+            } else {
+                nextPrayer = prayer
+                break
+            }
+        }
         
         return (currentPrayer, nextPrayer)
     }
@@ -260,12 +306,44 @@ class PrayerTimeService {
     /// Get the current active prayer period
     func getCurrentPrayerPeriod(from prayers: [Prayer], at currentTime: Date = Date()) -> (current: Prayer?, next: Prayer?) {
         let sortedPrayers = prayers.sorted { $0.time < $1.time }
-        return findCurrentAndNextPrayer(from: sortedPrayers, at: currentTime)
+        // This is a synchronous version - we can't await here, so return without tomorrow's prayer
+        return findCurrentAndNextPrayerSync(from: sortedPrayers, at: currentTime)
+    }
+    
+    // MARK: - Prayer Completion Synchronization
+    
+    /// Sync Prayer objects with existing PrayerCompletion records to restore completion states
+    private func syncPrayerCompletionStates(_ prayers: [Prayer], in context: ModelContext) async throws -> [Prayer] {
+        let completionManager = PrayerCompletionManager.shared
+        
+        for prayer in prayers {
+            do {
+                let completions = try completionManager.getCompletionStatus(
+                    for: prayer.time,
+                    locationId: prayer.locationId,
+                    in: context
+                )
+                
+                // Find matching completion record for this prayer type
+                if let completion = completions.first(where: { $0.prayerType == prayer.prayerType }) {
+                    // Update the prayer's completion state directly (Prayer is a @Model class)
+                    prayer.isCompleted = true
+                    prayer.completedAt = completion.completedAt
+                    print("Restored completion state for \(prayer.name)")
+                }
+            } catch {
+                print("Failed to sync completion state for \(prayer.name): \(error.localizedDescription)")
+                // Continue with other prayers even if one fails
+            }
+        }
+        
+        return prayers
     }
     
     // MARK: - Cache Management
     
     /// Clear all cached prayer data
+    @MainActor
     func clearAllCache(in context: ModelContext) throws {
         try cacheManager.performCleanup(in: context)
         cachedPrayers.removeAll()

@@ -97,19 +97,19 @@ class FavoriteLocationsManager: FavoriteLocationsManagerProtocol {
         // Create a copy and mark as favorite
         let favoriteLocation = location.asFavorite()
         
-        do {
-            // Insert into Core Data
-            context.insert(favoriteLocation)
-            try context.save()
-            
-            // Update local array
-            await MainActor.run {
+        try await MainActor.run {
+            do {
+                // Insert into Core Data
+                context.insert(favoriteLocation)
+                try context.save()
+                
+                // Update local array
                 self.favoriteLocations.append(favoriteLocation)
                 self.favoriteLocations.sort { $0.displayName < $1.displayName }
+                
+            } catch {
+                throw FavoriteLocationsError.persistenceError(error)
             }
-            
-        } catch {
-            throw FavoriteLocationsError.persistenceError(error)
         }
     }
     
@@ -118,36 +118,36 @@ class FavoriteLocationsManager: FavoriteLocationsManagerProtocol {
             throw FavoriteLocationsError.persistenceError(NSError(domain: "ModelContext", code: 0, userInfo: [NSLocalizedDescriptionKey: "Model context not available"]))
         }
         
-        // Fetch all locations and filter manually
-        let descriptor = FetchDescriptor<Location>()
-        
-        do {
-            let allLocations = try context.fetch(descriptor)
-            let favoriteLocations = allLocations.filter { $0.isFavorite }
+        try await MainActor.run {
+            // Fetch all locations and filter manually
+            let descriptor = FetchDescriptor<Location>()
             
-            // Find the matching location by name and coordinates
-            guard let foundLocation = favoriteLocations.first(where: { loc in
-                loc.name == location.name &&
-                abs(loc.latitude - location.latitude) < 0.001 &&
-                abs(loc.longitude - location.longitude) < 0.001
-            }) else {
-                throw FavoriteLocationsError.locationNotFound
-            }
-            
-            // Delete from Core Data
-            context.delete(foundLocation)
-            try context.save()
-            
-            // Update local array
-            await MainActor.run {
+            do {
+                let allLocations = try context.fetch(descriptor)
+                let favoriteLocations = allLocations.filter { $0.isFavorite }
+                
+                // Find the matching location by name and coordinates
+                guard let foundLocation = favoriteLocations.first(where: { loc in
+                    loc.name == location.name &&
+                    abs(loc.latitude - location.latitude) < 0.001 &&
+                    abs(loc.longitude - location.longitude) < 0.001
+                }) else {
+                    throw FavoriteLocationsError.locationNotFound
+                }
+                
+                // Delete from Core Data
+                context.delete(foundLocation)
+                try context.save()
+                
+                // Update local array
                 self.favoriteLocations.removeAll { $0.id == foundLocation.id }
-            }
-            
-        } catch {
-            if error is FavoriteLocationsError {
-                throw error
-            } else {
-                throw FavoriteLocationsError.persistenceError(error)
+                
+            } catch {
+                if error is FavoriteLocationsError {
+                    throw error
+                } else {
+                    throw FavoriteLocationsError.persistenceError(error)
+                }
             }
         }
     }
@@ -157,21 +157,23 @@ class FavoriteLocationsManager: FavoriteLocationsManagerProtocol {
             throw FavoriteLocationsError.persistenceError(NSError(domain: "ModelContext", code: 0, userInfo: [NSLocalizedDescriptionKey: "Model context not available"]))
         }
         
-        // Fetch all locations and filter favorites manually
-        let descriptor = FetchDescriptor<Location>(
-            sortBy: [SortDescriptor(\.name)]
-        )
-        
-        do {
-            let allLocations = try context.fetch(descriptor)
-            let favoriteLocations = allLocations.filter { $0.isFavorite }
+        return try await MainActor.run {
+            // Fetch all locations and filter favorites manually
+            let descriptor = FetchDescriptor<Location>(
+                sortBy: [SortDescriptor(\.name)]
+            )
             
-            // Validate all locations
-            try favoriteLocations.validateAll()
-            
-            return favoriteLocations
-        } catch {
-            throw FavoriteLocationsError.persistenceError(error)
+            do {
+                let allLocations = try context.fetch(descriptor)
+                let favoriteLocations = allLocations.filter { $0.isFavorite }
+                
+                // Validate all locations
+                try favoriteLocations.validateAll()
+                
+                return favoriteLocations
+            } catch {
+                throw FavoriteLocationsError.persistenceError(error)
+            }
         }
     }
     
@@ -197,39 +199,41 @@ class FavoriteLocationsManager: FavoriteLocationsManagerProtocol {
         // Validate location
         try location.validate()
         
-        // Fetch all locations and filter manually
-        let descriptor = FetchDescriptor<Location>()
-        
-        do {
-            let allLocations = try context.fetch(descriptor)
-            let favoriteLocations = allLocations.filter { $0.isFavorite }
+        try await MainActor.run {
+            // Fetch all locations and filter manually
+            let descriptor = FetchDescriptor<Location>()
             
-            // Find the matching location by ID
-            guard let foundLocation = favoriteLocations.first(where: { $0.id == location.id }) else {
-                throw FavoriteLocationsError.locationNotFound
-            }
-            
-            // Update the location
-            foundLocation.name = location.name
-            foundLocation.city = location.city
-            foundLocation.country = location.country
-            foundLocation.latitude = location.latitude
-            foundLocation.longitude = location.longitude
-            foundLocation.diyanetId = location.diyanetId
-            foundLocation.lastUpdated = Date()
-            
-            try context.save()
-            
-            // Update local array
-            await loadFavorites()
-            
-        } catch {
-            if error is FavoriteLocationsError {
-                throw error
-            } else {
-                throw FavoriteLocationsError.persistenceError(error)
+            do {
+                let allLocations = try context.fetch(descriptor)
+                let favoriteLocations = allLocations.filter { $0.isFavorite }
+                
+                // Find the matching location by ID
+                guard let foundLocation = favoriteLocations.first(where: { $0.id == location.id }) else {
+                    throw FavoriteLocationsError.locationNotFound
+                }
+                
+                // Update the location
+                foundLocation.name = location.name
+                foundLocation.city = location.city
+                foundLocation.country = location.country
+                foundLocation.latitude = location.latitude
+                foundLocation.longitude = location.longitude  
+                foundLocation.diyanetId = location.diyanetId
+                foundLocation.lastUpdated = Date()
+                
+                try context.save()
+                
+            } catch {
+                if error is FavoriteLocationsError {
+                    throw error
+                } else {
+                    throw FavoriteLocationsError.persistenceError(error)
+                }
             }
         }
+        
+        // Update local array
+        await loadFavorites()
     }
     
     func clearAllFavorites() async throws {
@@ -237,25 +241,25 @@ class FavoriteLocationsManager: FavoriteLocationsManagerProtocol {
             throw FavoriteLocationsError.persistenceError(NSError(domain: "ModelContext", code: 0, userInfo: [NSLocalizedDescriptionKey: "Model context not available"]))
         }
         
-        let descriptor = FetchDescriptor<Location>()
-        
-        do {
-            let allLocations = try context.fetch(descriptor)
-            let favoriteLocations = allLocations.filter { $0.isFavorite }
+        try await MainActor.run {
+            let descriptor = FetchDescriptor<Location>()
             
-            for location in favoriteLocations {
-                context.delete(location)
-            }
-            
-            try context.save()
-            
-            // Clear local array
-            await MainActor.run {
+            do {
+                let allLocations = try context.fetch(descriptor)
+                let favoriteLocations = allLocations.filter { $0.isFavorite }
+                
+                for location in favoriteLocations {
+                    context.delete(location)
+                }
+                
+                try context.save()
+                
+                // Clear local array
                 self.favoriteLocations.removeAll()
+                
+            } catch {
+                throw FavoriteLocationsError.persistenceError(error)
             }
-            
-        } catch {
-            throw FavoriteLocationsError.persistenceError(error)
         }
     }
     

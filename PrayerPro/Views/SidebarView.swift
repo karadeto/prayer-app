@@ -73,7 +73,7 @@ struct SidebarView: View {
         }
         .onAppear {
             setupFavoritesManager()
-            loadGPSLocationIfAvailable()
+            autoSelectInitialLocation()
         }
         .onReceive(NotificationCenter.default.publisher(for: .refreshPrayerTimes)) { _ in
             if let location = selectedLocation {
@@ -82,6 +82,9 @@ struct SidebarView: View {
                     loadGPSLocationIfAvailable()
                 }
             }
+        }
+        .onChange(of: favoritesManager.isLoading) { wasLoading, isLoading in
+            // Favorites have finished loading - no automatic selection
         }
     }
     
@@ -223,6 +226,26 @@ struct SidebarView: View {
             }
         }
     }
+    
+    private func autoSelectInitialLocation() {
+        Task {
+            // Only auto-select GPS location if permissions are available
+            if locationService.hasLocationPermission {
+                do {
+                    let location = try await locationService.getCurrentLocation()
+                    await MainActor.run {
+                        self.gpsLocation = location
+                        // Auto-select GPS location
+                        selectLocation(location)
+                    }
+                } catch {
+                    print("Failed to auto-load GPS location: \(error.localizedDescription)")
+                }
+            }
+            // Do not auto-select favorite locations - let user choose manually
+        }
+    }
+    
     
     private func removeFromFavorites(_ location: Location) async {
         do {

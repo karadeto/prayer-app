@@ -7,6 +7,7 @@
 
 import SwiftUI
 import SwiftData
+import AppKit
 
 struct PrayerTimesView: View {
     @Environment(\.modelContext) private var modelContext
@@ -18,9 +19,12 @@ struct PrayerTimesView: View {
     @State private var errorMessage: String?
     @State private var showingError = false
     @State private var currentPrayerStatus: PrayerStatus?
+    @State private var lastStatusUpdate: Date = Date()
+    @State private var shouldUpdateStatus: Bool = true
     @State private var refreshTimer: Timer?
     
     private let prayerTimeService = PrayerTimeService.shared
+    private let completionManager = PrayerCompletionManager.shared
     
     var body: some View {
         VStack(spacing: 0) {
@@ -36,12 +40,9 @@ struct PrayerTimesView: View {
                 } else {
                     prayerTimesList
                 }
-            } else {
-                // No Location Selected
-                noLocationSelectedView
             }
         }
-        .navigationTitle("Prayer Times")
+        .navigationTitle(selectedLocation != nil ? "Prayer Times" : "")
         .alert("Prayer Times Error", isPresented: $showingError) {
             Button("OK") { }
         } message: {
@@ -154,13 +155,21 @@ struct PrayerTimesView: View {
     
     private func currentPrayerStatusView(_ status: PrayerStatus) -> some View {
         VStack(spacing: 4) {
-            if let nextPrayer = status.nextPrayer {
+            // Only show next prayer if it's not during Isha and next prayer exists and is today
+            if let nextPrayer = status.nextPrayer, 
+               status.currentPrayer?.prayerType != .isha,
+               Calendar.current.isDateInToday(nextPrayer.time) {
                 HStack {
                     Text("Next: \(nextPrayer.prayerType.displayName)")
                         .font(.title)
                         .fontWeight(.medium)
                     
                     Spacer()
+
+                    Text("in")
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                        .foregroundColor(.blue)
                     
                     Text(timeRemainingText(status.timeUntilNext))
                         .font(.title)
@@ -170,15 +179,22 @@ struct PrayerTimesView: View {
             } else if let currentPrayer = status.currentPrayer {
                 HStack {
                     Text("Current: \(currentPrayer.prayerType.displayName)")
-                        .font(.subheadline)
+                        .font(.title)
                         .fontWeight(.medium)
                     
                     Spacer()
                     
-                    Text("In Progress")
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                        .foregroundColor(.orange)
+                    if status.timeUntilCurrentEnds > 0 {
+                        Text("Ends in \(timeRemainingText(status.timeUntilCurrentEnds))")
+                            .font(.title)
+                            .fontWeight(.medium)
+                            .foregroundColor(.orange)
+                    } else {
+                        Text("In Progress")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                            .foregroundColor(.orange)
+                    }
                 }
             }
         }
@@ -211,21 +227,14 @@ struct PrayerTimesView: View {
         )
     }
     
-    private var noLocationSelectedView: some View {
-        ContentUnavailableView(
-            "No Location Selected",
-            systemImage: "location.circle",
-            description: Text("Select a location from the sidebar to view prayer times")
-        )
-    }
     
     private var prayerTimesList: some View {
         List {
             ForEach(prayers) { prayer in
                 PrayerTimeRow(
                     prayer: prayer,
-                    isCurrentPrayer: currentPrayerStatus?.currentPrayer?.id == prayer.id,
-                    isNextPrayer: currentPrayerStatus?.nextPrayer?.id == prayer.id
+                    isCurrentPrayer: isCurrentPrayer(prayer),
+                    isNextPrayer: isNextPrayer(prayer)
                 ) {
                     togglePrayerCompletion(prayer)
                 }
@@ -252,7 +261,7 @@ struct PrayerTimesView: View {
                     self.isLoading = false
                     
                     // Update current prayer status
-                    updateCurrentPrayerStatus()
+                    updateCurrentPrayerStatus(force: true)
                 }
             } catch {
                 await MainActor.run {
@@ -264,51 +273,102 @@ struct PrayerTimesView: View {
         }
     }
     
-    private func updateCurrentPrayerStatus() {
+    private func updateCurrentPrayerStatus(force: Bool = false) {
         guard let location = selectedLocation else { return }
+        
+        // Only update prayer status every 30 seconds unless forced
+        let now = Date()
+        if !force && now.timeIntervalSince(lastStatusUpdate) < 30 {
+            return
+        }
         
         Task {
             let status = await prayerTimeService.getCurrentPrayerStatus(for: location, in: modelContext)
             
             await MainActor.run {
                 self.currentPrayerStatus = status
+                self.lastStatusUpdate = now
             }
         }
     }
     
+    private func updateTimerDisplay() {
+        // Force status update every 30 seconds or if we don't have status yet
+        if currentPrayerStatus == nil || Date().timeIntervalSince(lastStatusUpdate) >= 30 {
+            updateCurrentPrayerStatus(force: true)
+        } else {
+            // Just trigger a view refresh for countdown update
+            shouldUpdateStatus.toggle()
+        }
+    }
+    
     private func togglePrayerCompletion(_ prayer: Prayer) {
-        do {
-            if prayer.isCompleted {
-                prayer.markIncomplete()
-            } else {
-                try prayer.markCompleted()
+        Task {
+            do {
+                try await completionManager.togglePrayerCompletion(prayer, in: modelContext)
+                
+                // Force save and refresh to ensure persistence
+                await MainActor.run {
+                    try? modelContext.save()
+                    // Trigger view refresh
+                    updateCurrentPrayerStatus(force: true)
+                }
+            } catch {
+                await MainActor.run {
+                    errorMessage = error.localizedDescription
+                    showingError = true
+                }
             }
-            
-            // Save to context
-            try modelContext.save()
-            
-        } catch {
-            errorMessage = error.localizedDescription
-            showingError = true
         }
     }
     
     private func timeRemainingText(_ timeInterval: TimeInterval) -> String {
         let hours = Int(timeInterval) / 3600
         let minutes = Int(timeInterval) % 3600 / 60
+        let seconds = Int(timeInterval) % 60
         
         if hours > 0 {
             return "\(hours)h \(minutes)m"
-        } else {
+        } else if timeInterval >= 3600 { // 60 minutes or more
             return "\(minutes)m"
+        } else {
+            // Under 60 minutes, show seconds
+            return "\(minutes)m \(seconds)s"
         }
     }
+    
+    // MARK: - Helper Methods
+    
+    private func isCurrentPrayer(_ prayer: Prayer) -> Bool {
+        guard let currentPrayer = currentPrayerStatus?.currentPrayer else { return false }
+        
+        // Match by prayer type and time since IDs might be different for estimated prayers
+        return currentPrayer.prayerType == prayer.prayerType &&
+               Calendar.current.isDate(currentPrayer.time, inSameDayAs: prayer.time) &&
+               abs(currentPrayer.time.timeIntervalSince(prayer.time)) < 300 // Within 5 minutes
+    }
+    
+    private func isNextPrayer(_ prayer: Prayer) -> Bool {
+        guard let nextPrayer = currentPrayerStatus?.nextPrayer else { return false }
+        
+        // Only mark as next if it's today's prayer (not tomorrow's Fajr)
+        let isToday = Calendar.current.isDateInToday(prayer.time)
+        if !isToday { return false }
+        
+        // Match by prayer type and time
+        return nextPrayer.prayerType == prayer.prayerType &&
+               Calendar.current.isDate(nextPrayer.time, inSameDayAs: prayer.time) &&
+               abs(nextPrayer.time.timeIntervalSince(prayer.time)) < 300 // Within 5 minutes
+    }
+    
     
     // MARK: - Timer Management
     
     private func startRefreshTimer() {
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { _ in
-            updateCurrentPrayerStatus()
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            Task { @MainActor in
+                updateTimerDisplay()
+            }
         }
     }
     
@@ -326,6 +386,11 @@ struct PrayerTimeRow: View {
     let isNextPrayer: Bool
     let onCompletionToggle: () -> Void
     
+    @State private var isHovered = false
+    @State private var showCompletionAnimation = false
+    
+    private let completionManager = PrayerCompletionManager.shared
+    
     private var timeFormatter: DateFormatter {
         let formatter = DateFormatter()
         formatter.timeStyle = .short
@@ -334,6 +399,10 @@ struct PrayerTimeRow: View {
     
     private var isPrayerTimePassed: Bool {
         prayer.time < Date()
+    }
+    
+    private var visualState: PrayerVisualState {
+        completionManager.getVisualState(for: prayer)
     }
     
     var body: some View {
@@ -347,31 +416,35 @@ struct PrayerTimeRow: View {
                     Text(prayer.prayerType.displayName)
                         .font(.headline)
                         .foregroundColor(textColor)
+                        .strikethrough(prayer.isCompleted, color: .secondary)
                     
-                    if isCurrentPrayer {
-                        Text("NOW")
-                            .font(.caption)
-                            .fontWeight(.bold)
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.orange)
-                            .cornerRadius(4)
-                    } else if isNextPrayer {
-                        Text("NEXT")
-                            .font(.caption)
-                            .fontWeight(.bold)
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.blue)
-                            .cornerRadius(4)
+                    // Status badges
+                    statusBadges
+                    
+                    // Completion timestamp
+                    if prayer.isCompleted, let completedAt = prayer.completedAt {
+                        Text("✓ \(formatCompletionTime(completedAt))")
+                            .font(.caption2)
+                            .foregroundColor(.green)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.green.opacity(0.1))
+                            .cornerRadius(3)
                     }
                 }
                 
-                Text(timeFormatter.string(from: prayer.time))
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
+                HStack {
+                    Text(timeFormatter.string(from: prayer.time))
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                    
+                    // Time status indicator
+                    if isPrayerTimePassed && !prayer.isCompleted {
+                        Text("• Missed")
+                            .font(.caption2)
+                            .foregroundColor(.orange)
+                    }
+                }
             }
             
             Spacer()
@@ -381,31 +454,116 @@ struct PrayerTimeRow: View {
                 completionButton
             }
         }
-        .padding(.vertical, 8)
-        .padding(.horizontal, 8)
+        .padding(.vertical, 12)
+        .padding(.horizontal, 12)
         .background(rowBackground)
-        .cornerRadius(8)
+        .cornerRadius(10)
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(borderColor, lineWidth: borderWidth)
+        )
+        .scaleEffect(showCompletionAnimation ? 1.05 : 1.0)
+        .animation(.spring(response: 0.3, dampingFraction: 0.6), value: showCompletionAnimation)
+        .onHover { hovering in
+            isHovered = hovering
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .prayerCompletionChanged)) { notification in
+            if let notificationPrayer = notification.object as? Prayer,
+               notificationPrayer.id == prayer.id {
+                withAnimation {
+                    showCompletionAnimation = true
+                }
+                
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    showCompletionAnimation = false
+                }
+            }
+        }
     }
     
     // MARK: - Subviews
     
     private var prayerTypeIcon: some View {
-        Image(systemName: prayerTypeIconName)
-            .font(.title2)
-            .foregroundColor(iconColor)
-            .frame(width: 32, height: 32)
-            .background(iconBackgroundColor)
-            .cornerRadius(8)
+        ZStack {
+            Circle()
+                .fill(iconBackgroundColor)
+                .frame(width: 40, height: 40)
+            
+            Image(systemName: prayerTypeIconName)
+                .font(.title2)
+                .foregroundColor(iconColor)
+            
+            // Completion overlay
+            if prayer.isCompleted {
+                Circle()
+                    .fill(Color.green.opacity(0.2))
+                    .frame(width: 40, height: 40)
+                
+                Image(systemName: "checkmark")
+                    .font(.caption)
+                    .foregroundColor(.green)
+                    .fontWeight(.bold)
+                    .offset(x: 12, y: -12)
+                    .background(
+                        Circle()
+                            .fill(Color.green)
+                            .frame(width: 16, height: 16)
+                    )
+            }
+        }
+    }
+    
+    private var statusBadges: some View {
+        HStack(spacing: 4) {
+            if isCurrentPrayer {
+                Text("NOW")
+                    .font(.caption)
+                    .fontWeight(.bold)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.orange)
+                    .cornerRadius(4)
+            } else if isNextPrayer {
+                Text("NEXT")
+                    .font(.caption)
+                    .fontWeight(.bold)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.blue)
+                    .cornerRadius(4)
+            }
+        }
     }
     
     private var completionButton: some View {
-        Button(action: onCompletionToggle) {
-            Image(systemName: prayer.isCompleted ? "checkmark.circle.fill" : "circle")
-                .font(.title2)
-                .foregroundColor(prayer.isCompleted ? .green : .secondary)
+        Button(action: {
+            onCompletionToggle()
+        }) {
+            HStack(spacing: 6) {
+                Image(systemName: visualState.iconName)
+                    .font(.title2)
+                    .foregroundColor(Color(visualState.color))
+                
+                if isHovered {
+                    Text(prayer.isCompleted ? "Undo" : "Done")
+                        .font(.caption)
+                        .foregroundColor(Color(visualState.color))
+                        .transition(.opacity.combined(with: .scale))
+                }
+            }
+            .frame(minWidth: 0)
+            .padding(.horizontal, isHovered ? 8 : 4)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color(visualState.color).opacity(isHovered ? 0.1 : 0))
+            )
         }
         .buttonStyle(.plain)
         .help(prayer.isCompleted ? "Mark as incomplete" : "Mark as completed")
+        .animation(.easeInOut(duration: 0.2), value: isHovered)
     }
     
     // MARK: - Computed Properties
@@ -460,14 +618,42 @@ struct PrayerTimeRow: View {
     
     private var rowBackground: Color {
         if isCurrentPrayer {
-            return Color.orange.opacity(0.1)
+            return Color.orange.opacity(0.15)
         } else if isNextPrayer {
-            return Color.blue.opacity(0.1)
+            return Color.blue.opacity(0.15)
         } else if prayer.isCompleted {
             return Color.green.opacity(0.1)
+        } else if isPrayerTimePassed {
+            return Color.orange.opacity(0.05)
+        } else {
+            return Color(NSColor.controlBackgroundColor).opacity(isHovered ? 0.8 : 0.3)
+        }
+    }
+    
+    private var borderColor: Color {
+        if prayer.isCompleted {
+            return Color.green.opacity(0.3)
+        } else if isCurrentPrayer {
+            return Color.orange.opacity(0.5)
+        } else if isNextPrayer {
+            return Color.blue.opacity(0.5)
         } else {
             return Color.clear
         }
+    }
+    
+    private var borderWidth: CGFloat {
+        if prayer.isCompleted || isCurrentPrayer || isNextPrayer {
+            return 1.5
+        } else {
+            return 0
+        }
+    }
+    
+    private func formatCompletionTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
     }
 }
 
