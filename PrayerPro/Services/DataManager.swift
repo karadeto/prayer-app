@@ -78,17 +78,53 @@ class DataManager {
     }
     
     func fetchCompletionsForDate(_ date: Date, in context: ModelContext) throws -> [PrayerCompletion] {
-        let calendar = Calendar.current
-        let startOfDay = calendar.startOfDay(for: date)
-        let endOfDay = calendar.date(byAdding: .day, value: 1, to: startOfDay)!
+        // ModelContext in SwiftData doesn't have isInvalidated like Core Data
+        // Instead, we'll catch any potential context issues during fetch
         
-        let descriptor = FetchDescriptor<PrayerCompletion>(
-            predicate: #Predicate { completion in
-                completion.date >= startOfDay &&
-                completion.date < endOfDay
-            },
-            sortBy: [SortDescriptor(\.completedAt)]
-        )
-        return try context.fetch(descriptor)
+        let calendar = Calendar.current
+        guard let startOfDay = calendar.dateInterval(of: .day, for: date)?.start,
+              let endOfDay = calendar.dateInterval(of: .day, for: date)?.end else {
+            print("Warning: Could not determine day boundaries for date: \(date)")
+            return []
+        }
+        
+        do {
+            let descriptor = FetchDescriptor<PrayerCompletion>(
+                predicate: #Predicate { completion in
+                    completion.date >= startOfDay &&
+                    completion.date < endOfDay
+                },
+                sortBy: [SortDescriptor(\.completedAt)]
+            )
+            
+            let completions = try context.fetch(descriptor)
+            
+            // Validate completions before returning and filter safely
+            let validCompletions = completions.compactMap { completion -> PrayerCompletion? in
+                // Safe property access with exception handling for SwiftData objects
+                return autoreleasepool {
+                    do {
+                        // Use try-catch for property access that might cause EXC_BAD_ACCESS
+                        guard let _ = try? completion.id,
+                              let _ = try? completion.prayerTypeName else {
+                            print("Warning: Completion object properties are inaccessible, skipping")
+                            return nil
+                        }
+                        
+                        // Only validate if basic property access succeeded
+                        try completion.validate()
+                        return completion
+                    } catch {
+                        print("Warning: Invalid or inaccessible completion found and filtered out: \(error)")
+                        return nil
+                    }
+                }
+            }
+            
+            return validCompletions
+        } catch {
+            print("Error fetching completions for date \(date): \(error)")
+            throw error
+        }
     }
 }

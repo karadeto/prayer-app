@@ -13,6 +13,8 @@ struct MainWindowView: View {
     @State private var sidebarVisibility: NavigationSplitViewVisibility = .all
     @State private var selectedTab: MainTab = .prayerTimes
     
+    @EnvironmentObject private var statusBarController: StatusBarController
+    
     enum MainTab: String, CaseIterable {
         case prayerTimes = "Prayer Times"
         case history = "History"
@@ -29,6 +31,10 @@ struct MainWindowView: View {
         NavigationSplitView(columnVisibility: $sidebarVisibility) {
             SidebarView { location in
                 selectedLocation = location
+                // Update status bar widget when location changes
+                statusBarController.updateLocation(location)
+                // Post notification for other components
+                NotificationCenter.default.post(name: .locationSelected, object: location)
             }
             .navigationSplitViewColumnWidth(min: 250, ideal: 300, max: 400)
         } detail: {

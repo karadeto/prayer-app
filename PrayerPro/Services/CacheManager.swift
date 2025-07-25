@@ -133,22 +133,54 @@ class CacheManager {
     
     /// Cache daily prayer times for a location
     func cacheDailyPrayers(_ prayers: [Prayer], for locationId: UUID, date: Date, in context: ModelContext) throws {
-        // Remove existing entry for same location and date
-        try removeDailyCacheEntry(for: locationId, date: date, in: context)
+        // Validate input parameters
+        guard !prayers.isEmpty else {
+            print("CacheManager: Skipping cache - no prayers to cache")
+            return
+        }
         
-        // Create new cache entry
-        let entry = try DailyCacheEntry(
-            locationId: locationId,
-            date: date,
-            prayers: prayers,
-            expiryHours: config.dailyCacheExpiryHours
-        )
+        // Validate all prayers before caching
+        do {
+            try prayers.validateAll()
+        } catch {
+            print("CacheManager: Invalid prayers data, skipping cache: \(error)")
+            throw CacheError.serializationFailed(error)
+        }
         
-        context.insert(entry)
-        try context.save()
-        
-        // Cleanup if needed
-        try cleanupDailyCacheIfNeeded(in: context)
+        // Perform operations with proper error handling
+        do {
+            // Remove existing entry for same location and date with error handling
+            try removeDailyCacheEntry(for: locationId, date: date, in: context)
+            
+            // Force save after deletion to avoid hash table conflicts
+            try context.save()
+            
+            // Create new cache entry with validation
+            let entry = try DailyCacheEntry(
+                locationId: locationId,
+                date: date,
+                prayers: prayers,
+                expiryHours: config.dailyCacheExpiryHours
+            )
+            
+            // Insert and save immediately
+            context.insert(entry)
+            try context.save()
+            
+            print("CacheManager: Successfully cached \(prayers.count) prayers for location \(locationId)")
+            
+            // Cleanup if needed (with separate error handling)
+            do {
+                try cleanupDailyCacheIfNeeded(in: context)
+            } catch {
+                print("CacheManager: Cleanup failed but cache operation succeeded: \(error)")
+                // Don't throw - cache operation was successful
+            }
+            
+        } catch {
+            print("CacheManager: Failed to cache daily prayers: \(error)")
+            throw CacheError.serializationFailed(error)
+        }
     }
     
     /// Retrieve cached daily prayer times
@@ -194,22 +226,54 @@ class CacheManager {
     
     /// Cache annual prayer times for a location
     func cacheAnnualPrayers(_ prayers: [Prayer], for locationId: UUID, year: Int, in context: ModelContext) throws {
-        // Remove existing entry for same location and year
-        try removeAnnualCacheEntry(for: locationId, year: year, in: context)
+        // Validate input parameters
+        guard !prayers.isEmpty else {
+            print("CacheManager: Skipping annual cache - no prayers to cache")
+            return
+        }
         
-        // Create new cache entry
-        let entry = try AnnualCacheEntry(
-            locationId: locationId,
-            year: year,
-            prayers: prayers,
-            expiryDays: config.annualCacheExpiryDays
-        )
+        // Validate all prayers before caching
+        do {
+            try prayers.validateAll()
+        } catch {
+            print("CacheManager: Invalid annual prayers data, skipping cache: \(error)")
+            throw CacheError.serializationFailed(error)
+        }
         
-        context.insert(entry)
-        try context.save()
-        
-        // Cleanup if needed
-        try cleanupAnnualCacheIfNeeded(in: context)
+        // Perform operations with proper error handling
+        do {
+            // Remove existing entry for same location and year with error handling
+            try removeAnnualCacheEntry(for: locationId, year: year, in: context)
+            
+            // Force save after deletion to avoid hash table conflicts
+            try context.save()
+            
+            // Create new cache entry with validation
+            let entry = try AnnualCacheEntry(
+                locationId: locationId,
+                year: year,
+                prayers: prayers,
+                expiryDays: config.annualCacheExpiryDays
+            )
+            
+            // Insert and save immediately
+            context.insert(entry)
+            try context.save()
+            
+            print("CacheManager: Successfully cached \(prayers.count) annual prayers for location \(locationId)")
+            
+            // Cleanup if needed (with separate error handling)
+            do {
+                try cleanupAnnualCacheIfNeeded(in: context)
+            } catch {
+                print("CacheManager: Annual cleanup failed but cache operation succeeded: \(error)")
+                // Don't throw - cache operation was successful
+            }
+            
+        } catch {
+            print("CacheManager: Failed to cache annual prayers: \(error)")
+            throw CacheError.serializationFailed(error)
+        }
     }
     
     /// Retrieve cached annual prayer times
@@ -363,15 +427,32 @@ class CacheManager {
     private func removeDailyCacheEntry(for locationId: UUID, date: Date, in context: ModelContext) throws {
         let startOfDay = Calendar.current.startOfDay(for: date)
         
-        let descriptor = FetchDescriptor<DailyCacheEntry>(
-            predicate: #Predicate { entry in
-                entry.locationId == locationId && entry.date == startOfDay
+        do {
+            let descriptor = FetchDescriptor<DailyCacheEntry>(
+                predicate: #Predicate { entry in
+                    entry.locationId == locationId && entry.date == startOfDay
+                }
+            )
+            
+            let existingEntries = try context.fetch(descriptor)
+            
+            if !existingEntries.isEmpty {
+                print("CacheManager: Removing \(existingEntries.count) existing daily cache entries")
+                
+                // Delete entries one by one with validation
+                for entry in existingEntries {
+                    // Validate entry before deletion
+                    guard entry.id.uuidString.count == 36 else {
+                        print("CacheManager: Skipping invalid entry with corrupt ID")
+                        continue
+                    }
+                    
+                    context.delete(entry)
+                }
             }
-        )
-        
-        let existingEntries = try context.fetch(descriptor)
-        for entry in existingEntries {
-            context.delete(entry)
+        } catch {
+            print("CacheManager: Error removing daily cache entries: \(error)")
+            throw error
         }
     }
     

@@ -72,6 +72,26 @@ extension TimeInterval {
         }
     }
     
+    /// Format for status bar display (minimized)
+    var statusBarFormat: String {
+        let totalMinutes = Int(self) / 60
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        let seconds = Int(self) % 60
+        
+        if totalMinutes >= 60 {
+            if minutes > 0 {
+                return "\(hours)h \(minutes)m"
+            } else {
+                return "\(hours)h"
+            }
+        } else if totalMinutes > 0 {
+            return "\(totalMinutes)m"
+        } else {
+            return "\(seconds)s"
+        }
+    }
+    
     /// Format as human readable duration
     var humanReadableDuration: String {
         let hours = Int(self) / 3600
@@ -104,6 +124,24 @@ extension Color {
             return .red
         case .isha:
             return .indigo
+        }
+    }
+    
+    /// Prayer type specific icons
+    static func prayerIcon(for prayerType: PrayerType) -> String {
+        switch prayerType {
+        case .fajr:
+            return "moon.stars"
+        case .sunrise:
+            return "sunrise"
+        case .dhuhr:
+            return "sun.max"
+        case .asr:
+            return "sun.min"
+        case .maghrib:
+            return "sunset"
+        case .isha:
+            return "moon"
         }
     }
     

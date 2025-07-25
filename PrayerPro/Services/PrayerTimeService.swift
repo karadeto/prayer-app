@@ -318,6 +318,9 @@ class PrayerTimeService {
         
         for prayer in prayers {
             do {
+                // SwiftData contexts don't have isInvalidated like Core Data
+                // We'll handle context issues through error handling
+                
                 let completions = try completionManager.getCompletionStatus(
                     for: prayer.time,
                     locationId: prayer.locationId,

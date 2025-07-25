@@ -145,12 +145,41 @@ class LocationService: NSObject, LocationServiceProtocol {
     
     private func getCurrentCLLocation() async throws -> CLLocation {
         return try await withCheckedThrowingContinuation { continuation in
+            // Ensure we don't have a pending continuation
+            if let existingContinuation = self.locationContinuation {
+                existingContinuation.resume(throwing: LocationError.locationUnavailable)
+            }
+            
             self.locationContinuation = continuation
             
             // Set up timeout timer
-            self.locationTimer = Timer.scheduledTimer(withTimeInterval: locationTimeout, repeats: false) { _ in
-                self.locationContinuation?.resume(throwing: LocationError.timeout)
+            self.locationTimer = Timer.scheduledTimer(withTimeInterval: locationTimeout, repeats: false) { [weak self] _ in
+                guard let self = self else { return }
+                if let cont = self.locationContinuation {
+                    cont.resume(throwing: LocationError.timeout)
+                    self.locationContinuation = nil
+                    self.locationTimer?.invalidate()
+                    self.locationTimer = nil
+                }
+            }
+            
+            // Check if location services are still enabled before requesting
+            guard CLLocationManager.locationServicesEnabled() else {
+                self.locationTimer?.invalidate()
+                self.locationTimer = nil
+                continuation.resume(throwing: LocationError.serviceDisabled)
                 self.locationContinuation = nil
+                return
+            }
+            
+            // Check authorization status
+            let status = locationManager.authorizationStatus
+            guard status == .authorized || status == .authorizedAlways else {
+                self.locationTimer?.invalidate()
+                self.locationTimer = nil
+                continuation.resume(throwing: LocationError.permissionDenied)
+                self.locationContinuation = nil
+                return
             }
             
             // Request location

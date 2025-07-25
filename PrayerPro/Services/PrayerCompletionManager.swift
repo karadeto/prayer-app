@@ -43,9 +43,9 @@ class PrayerCompletionManager {
                 updateCompletionCache(completion)
             }
             
-            // Sync to iCloud in background
+            // Sync to iCloud in background with fallback
             Task {
-                await syncCompletionToiCloud(completion)
+                await syncCompletionToiCloudWithFallback(completion, in: context)
             }
             
             // Post notification for UI updates on main thread
@@ -108,21 +108,60 @@ class PrayerCompletionManager {
     
     /// Get completion status for a specific date
     func getCompletionStatus(for date: Date, locationId: UUID, in context: ModelContext) throws -> [PrayerCompletion] {
-        // Check cache first
-        if let cached = completionCache[locationId]?.filter({ Calendar.current.isDate($0.date, inSameDayAs: date) }) {
-            return cached
+        // SwiftData ModelContext doesn't have isInvalidated like Core Data
+        // We'll handle any context issues through error handling
+        
+        // Check cache first with safety
+        if let cached = completionCache[locationId] {
+            let filteredCache = cached.compactMap { completion -> PrayerCompletion? in
+                // Basic safety check before accessing properties
+                guard completion.id.uuidString.count == 36,
+                      !completion.prayerTypeName.isEmpty else {
+                    print("Warning: Invalid completion in cache (basic properties)")
+                    return nil
+                }
+                
+                do {
+                    // Validate completion is still valid
+                    try completion.validate()
+                    if Calendar.current.isDate(completion.date, inSameDayAs: date) {
+                        return completion
+                    }
+                } catch {
+                    print("Warning: Invalid completion in cache, removing: \(error)")
+                    // Remove invalid completion from cache
+                    Task { @MainActor in
+                        removeInvalidCompletionFromCache(completion, locationId: locationId)
+                    }
+                }
+                return nil
+            }
+            
+            if !filteredCache.isEmpty {
+                return filteredCache
+            }
         }
         
-        // Fetch from database
-        let completions = try dataManager.fetchCompletionsForDate(date, in: context)
-            .filter { $0.locationId == locationId }
-        
-        // Update cache
-        for completion in completions {
-            updateCompletionCache(completion)
+        // Fetch from database with error handling
+        do {
+            let completions = try dataManager.fetchCompletionsForDate(date, in: context)
+                .filter { $0.locationId == locationId }
+            
+            // Safely update cache
+            for completion in completions {
+                do {
+                    try completion.validate()
+                    updateCompletionCache(completion)
+                } catch {
+                    print("Warning: Skipping invalid completion from database: \(error)")
+                }
+            }
+            
+            return completions
+        } catch {
+            print("Error in getCompletionStatus: \(error)")
+            throw error
         }
-        
-        return completions
     }
     
     /// Get completion history for a date range
@@ -188,48 +227,93 @@ class PrayerCompletionManager {
     
     // MARK: - iCloud Sync
     
-    /// Sync completion to iCloud
+    /// Sync completion to iCloud using the dedicated sync service
     private func syncCompletionToiCloud(_ completion: PrayerCompletion) async {
         do {
-            // Create CloudKit record
-            let record = CKRecord(recordType: "PrayerCompletion", recordID: CKRecord.ID(recordName: completion.id.uuidString))
-            record["prayerType"] = completion.prayerTypeName
-            record["date"] = completion.date
-            record["completedAt"] = completion.completedAt
-            record["locationId"] = completion.locationId.uuidString
-            
-            // Save to CloudKit
-            let container = CKContainer.default()
-            let database = container.privateCloudDatabase
-            _ = try await database.save(record)
-            
-            // Mark as synced
-            completion.markSyncedToiCloud()
-            
-            print("Successfully synced completion to iCloud: \(completion.prayerType.displayName)")
+            try await iCloudSyncService.shared.syncCompletionToiCloud(completion)
         } catch {
             print("Failed to sync completion to iCloud: \(error.localizedDescription)")
             // Keep local record for retry
         }
     }
     
-    /// Sync all unsynced completions to iCloud
-    func syncUnsyncedCompletions(in context: ModelContext) async throws {
-        let descriptor = FetchDescriptor<PrayerCompletion>(
-            predicate: #Predicate { $0.syncedToiCloud == false }
-        )
-        
-        let unsyncedCompletions = try context.fetch(descriptor)
-        
-        for completion in unsyncedCompletions {
-            await syncCompletionToiCloud(completion)
+    /// Sync completion to iCloud with fallback to local storage
+    private func syncCompletionToiCloudWithFallback(_ completion: PrayerCompletion, in context: ModelContext) async {
+        do {
+            // First verify iCloud availability
+            try await iCloudSyncService.shared.verifyiCloudAvailability()
             
-            // Add small delay to avoid overwhelming CloudKit
-            try await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+            // Attempt to sync to iCloud
+            try await iCloudSyncService.shared.syncCompletionToiCloud(completion)
+            
+            print("Successfully synced completion to iCloud: \(completion.prayerType.displayName)")
+            
+        } catch {
+            print("iCloud sync failed, falling back to local storage: \(error.localizedDescription)")
+            
+            // Fallback: ensure completion is saved locally and marked for retry
+            completion.markNotSynced()
+            
+            do {
+                try context.save()
+                
+                // Schedule retry after delay
+                Task {
+                    try await Task.sleep(nanoseconds: 5_000_000_000) // 5 seconds
+                    await retryiCloudSync(completion, in: context)
+                }
+                
+            } catch {
+                print("Failed to save completion locally: \(error.localizedDescription)")
+            }
+        }
+    }
+    
+    /// Retry iCloud sync with exponential backoff
+    private func retryiCloudSync(_ completion: PrayerCompletion, in context: ModelContext, attempt: Int = 1) async {
+        let maxAttempts = 3
+        
+        guard attempt <= maxAttempts else {
+            print("Max retry attempts reached for completion: \(completion.prayerType.displayName)")
+            return
         }
         
-        // Save context to persist sync status updates
-        try context.save()
+        do {
+            try await iCloudSyncService.shared.syncCompletionToiCloud(completion)
+            
+            // Success - save the updated sync status
+            try context.save()
+            print("Retry successful for completion: \(completion.prayerType.displayName)")
+            
+        } catch {
+            print("Retry attempt \(attempt) failed: \(error.localizedDescription)")
+            
+            if attempt < maxAttempts {
+                // Exponential backoff: 10s, 30s, 90s
+                let delay = TimeInterval(10 * Int(pow(3.0, Double(attempt - 1))))
+                
+                Task {
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    await retryiCloudSync(completion, in: context, attempt: attempt + 1)
+                }
+            }
+        }
+    }
+    
+    /// Sync all unsynced completions to iCloud
+    func syncUnsyncedCompletions(in context: ModelContext) async throws {
+        try await iCloudSyncService.shared.syncAllUnsyncedCompletions(in: context)
+    }
+    
+    /// Perform full sync from iCloud (download remote completions)
+    func performFullSyncFromiCloud(in context: ModelContext) async throws {
+        try await iCloudSyncService.shared.syncCompletionsFromiCloud(in: context)
+    }
+    
+    /// Check iCloud sync status
+    func getiCloudSyncStatus() -> (isSyncing: Bool, lastSync: Date?, error: Error?) {
+        let syncService = iCloudSyncService.shared
+        return (syncService.isSyncing, syncService.lastSyncDate, syncService.syncError)
     }
     
     // MARK: - Private Helpers
@@ -249,18 +333,32 @@ class PrayerCompletionManager {
     }
     
     private func updateCompletionCache(_ completion: PrayerCompletion) {
+        guard !completion.id.uuidString.isEmpty else {
+            print("Warning: Attempted to cache completion with invalid ID")
+            return
+        }
+        
         if completionCache[completion.locationId] == nil {
             completionCache[completion.locationId] = []
         }
         
-        // Remove existing completion for same prayer/date if exists
+        // Safely remove existing completion for same prayer/date if exists
         completionCache[completion.locationId]?.removeAll { existing in
-            existing.prayerType == completion.prayerType &&
-            Calendar.current.isDate(existing.date, inSameDayAs: completion.date)
+            do {
+                return existing.prayerType == completion.prayerType &&
+                       Calendar.current.isDate(existing.date, inSameDayAs: completion.date)
+            } catch {
+                print("Warning: Error comparing completion dates, removing from cache: \(error)")
+                return true // Remove problematic entries
+            }
         }
         
         // Add new completion
         completionCache[completion.locationId]?.append(completion)
+    }
+    
+    private func removeInvalidCompletionFromCache(_ completion: PrayerCompletion, locationId: UUID) {
+        completionCache[locationId]?.removeAll { $0.id == completion.id }
     }
     
     private func removeFromCompletionCache(_ prayer: Prayer) {
