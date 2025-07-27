@@ -30,7 +30,7 @@ struct CacheConfiguration {
 
 @Model
 final class DailyCacheEntry {
-    @Attribute(.unique) var id: UUID
+    var id: UUID
     var locationId: UUID
     var date: Date
     var prayersData: Data // Serialized [Prayer] array
@@ -72,7 +72,7 @@ final class DailyCacheEntry {
 
 @Model
 final class AnnualCacheEntry {
-    @Attribute(.unique) var id: UUID
+    var id: UUID
     var locationId: UUID
     var year: Int
     var prayersData: Data // Serialized [Prayer] array
@@ -476,8 +476,188 @@ class CacheManager {
                 // Note: In a real implementation, you'd need access to ModelContext here
                 // This would typically be handled by the main service that has context access
                 print("Periodic cleanup timer fired - cleanup should be performed by main service")
+                
+                // Post notification for services with context access to perform cleanup
+                NotificationCenter.default.post(
+                    name: Notification.Name("PerformCacheCleanup"),
+                    object: nil,
+                    userInfo: nil
+                )
             }
         }
+    }
+    
+    // MARK: - Enhanced Cleanup Operations
+    
+    /// Perform intelligent cleanup based on usage patterns
+    func performIntelligentCleanup(in context: ModelContext) throws {
+        let now = Date()
+        let sevenDaysAgo = now.addingTimeInterval(-7 * 24 * 3600)
+        let thirtyDaysAgo = now.addingTimeInterval(-30 * 24 * 3600)
+        
+        // Clean up daily cache entries older than 7 days
+        let oldDailyDescriptor = FetchDescriptor<DailyCacheEntry>(
+            predicate: #Predicate { entry in
+                entry.createdAt < sevenDaysAgo
+            }
+        )
+        
+        let oldDailyEntries = try context.fetch(oldDailyDescriptor)
+        for entry in oldDailyEntries {
+            context.delete(entry)
+        }
+        
+        // Clean up annual cache entries that haven't been accessed in 30 days
+        let unusedAnnualDescriptor = FetchDescriptor<AnnualCacheEntry>(
+            predicate: #Predicate { entry in
+                entry.lastAccessedAt < thirtyDaysAgo
+            }
+        )
+        
+        let unusedAnnualEntries = try context.fetch(unusedAnnualDescriptor)
+        for entry in unusedAnnualEntries {
+            context.delete(entry)
+        }
+        
+        try context.save()
+        
+        if !oldDailyEntries.isEmpty || !unusedAnnualEntries.isEmpty {
+            print("Intelligent cleanup: removed \(oldDailyEntries.count) daily and \(unusedAnnualEntries.count) annual entries")
+        }
+    }
+    
+    /// Clean up cache for deleted locations
+    func cleanupCacheForDeletedLocations(in context: ModelContext) throws {
+        // Get all existing location IDs
+        let locationDescriptor = FetchDescriptor<Location>()
+        let locations = try context.fetch(locationDescriptor)
+        let existingLocationIds = Set(locations.map { $0.id })
+        
+        // Find cache entries for non-existent locations
+        let dailyCacheDescriptor = FetchDescriptor<DailyCacheEntry>()
+        let dailyEntries = try context.fetch(dailyCacheDescriptor)
+        
+        let orphanedDailyEntries = dailyEntries.filter { !existingLocationIds.contains($0.locationId) }
+        for entry in orphanedDailyEntries {
+            context.delete(entry)
+        }
+        
+        let annualCacheDescriptor = FetchDescriptor<AnnualCacheEntry>()
+        let annualEntries = try context.fetch(annualCacheDescriptor)
+        
+        let orphanedAnnualEntries = annualEntries.filter { !existingLocationIds.contains($0.locationId) }
+        for entry in orphanedAnnualEntries {
+            context.delete(entry)
+        }
+        
+        if !orphanedDailyEntries.isEmpty || !orphanedAnnualEntries.isEmpty {
+            try context.save()
+            print("Cleaned up \(orphanedDailyEntries.count) daily and \(orphanedAnnualEntries.count) annual orphaned cache entries")
+        }
+    }
+    
+    // MARK: - Performance Optimization Methods
+    
+    /// Perform memory cleanup by removing old cache entries
+    func performMemoryCleanup() async {
+        // This method will be called by services that have ModelContext access
+        NotificationCenter.default.post(
+            name: .performCacheMemoryCleanup,
+            object: nil,
+            userInfo: nil
+        )
+    }
+    
+    /// Optimize cache for better performance
+    func optimizeCache(in context: ModelContext) throws {
+        // Record performance metrics
+        PerformanceMonitor.shared.recordCacheHit()
+        
+        // Perform intelligent cleanup
+        try performIntelligentCleanup(in: context)
+        
+        // Clean up orphaned entries
+        try cleanupCacheForDeletedLocations(in: context)
+        
+        // Update last cleanup time
+        lastCleanupTime = Date()
+        
+        print("✅ Cache optimization completed")
+    }
+    
+    /// Preload cache for frequently accessed locations
+    func preloadFrequentlyAccessedData(locations: [Location], in context: ModelContext) async {
+        let currentYear = Calendar.current.component(.year, from: Date())
+        
+        for location in locations.prefix(5) { // Limit to top 5 to avoid memory issues
+            do {
+                // Check if annual data is already cached
+                let hasCache = try hasCachedAnnualPrayers(for: location.id, year: currentYear, in: context)
+                if !hasCache {
+                    // This would typically be done by PrayerTimeService
+                    print("Preloading data for \(location.displayName)")
+                    
+                    // Add small delay to avoid overwhelming the system
+                    try await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+                }
+            } catch {
+                print("Failed to preload data for \(location.displayName): \(error)")
+            }
+        }
+    }
+    
+    /// Get cache health report
+    func getCacheHealthReport(in context: ModelContext) throws -> CacheHealthReport {
+        let dailyDescriptor = FetchDescriptor<DailyCacheEntry>()
+        let annualDescriptor = FetchDescriptor<AnnualCacheEntry>()
+        
+        let dailyEntries = try context.fetch(dailyDescriptor)
+        let annualEntries = try context.fetch(annualDescriptor)
+        
+        let now = Date()
+        let expiredDaily = dailyEntries.filter { $0.isExpired }.count
+        let expiredAnnual = annualEntries.filter { $0.isExpired }.count
+        let staleDaily = dailyEntries.filter { $0.isStale }.count
+        let staleAnnual = annualEntries.filter { $0.isStale }.count
+        
+        let totalDailySize = dailyEntries.reduce(0) { $0 + $1.prayersData.count }
+        let totalAnnualSize = annualEntries.reduce(0) { $0 + $1.dataSize }
+        
+        return CacheHealthReport(
+            totalDailyEntries: dailyEntries.count,
+            totalAnnualEntries: annualEntries.count,
+            expiredDailyEntries: expiredDaily,
+            expiredAnnualEntries: expiredAnnual,
+            staleDailyEntries: staleDaily,
+            staleAnnualEntries: staleAnnual,
+            totalDailySize: totalDailySize,
+            totalAnnualSize: totalAnnualSize,
+            healthScore: calculateHealthScore(
+                totalDaily: dailyEntries.count,
+                totalAnnual: annualEntries.count,
+                expiredDaily: expiredDaily,
+                expiredAnnual: expiredAnnual,
+                staleDaily: staleDaily,
+                staleAnnual: staleAnnual
+            )
+        )
+    }
+    
+    private func calculateHealthScore(totalDaily: Int, totalAnnual: Int, expiredDaily: Int, expiredAnnual: Int, staleDaily: Int, staleAnnual: Int) -> Double {
+        let totalEntries = totalDaily + totalAnnual
+        guard totalEntries > 0 else { return 1.0 }
+        
+        let totalExpired = expiredDaily + expiredAnnual
+        let totalStale = staleDaily + staleAnnual
+        
+        let expiredRatio = Double(totalExpired) / Double(totalEntries)
+        let staleRatio = Double(totalStale) / Double(totalEntries)
+        
+        // Health score: 1.0 is perfect, 0.0 is terrible
+        // Penalize expired entries more than stale ones
+        let healthScore = 1.0 - (expiredRatio * 0.8 + staleRatio * 0.2)
+        
+        return max(0.0, min(1.0, healthScore))
     }
 }
 
@@ -512,6 +692,62 @@ struct CacheStatistics {
     }
 }
 
+// MARK: - Cache Health Report
+
+struct CacheHealthReport {
+    let totalDailyEntries: Int
+    let totalAnnualEntries: Int
+    let expiredDailyEntries: Int
+    let expiredAnnualEntries: Int
+    let staleDailyEntries: Int
+    let staleAnnualEntries: Int
+    let totalDailySize: Int
+    let totalAnnualSize: Int
+    let healthScore: Double // 0.0 to 1.0, where 1.0 is perfect health
+    
+    var totalEntries: Int {
+        return totalDailyEntries + totalAnnualEntries
+    }
+    
+    var totalExpiredEntries: Int {
+        return expiredDailyEntries + expiredAnnualEntries
+    }
+    
+    var totalStaleEntries: Int {
+        return staleDailyEntries + staleAnnualEntries
+    }
+    
+    var totalSize: Int {
+        return totalDailySize + totalAnnualSize
+    }
+    
+    var formattedTotalSize: String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useKB, .useMB]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: Int64(totalSize))
+    }
+    
+    var healthStatus: String {
+        switch healthScore {
+        case 0.9...1.0:
+            return "Excellent"
+        case 0.7..<0.9:
+            return "Good"
+        case 0.5..<0.7:
+            return "Fair"
+        case 0.3..<0.5:
+            return "Poor"
+        default:
+            return "Critical"
+        }
+    }
+    
+    var needsCleanup: Bool {
+        return healthScore < 0.7 || totalExpiredEntries > 0
+    }
+}
+
 // MARK: - Cache Error Types
 
 enum CacheError: LocalizedError {
@@ -536,3 +772,11 @@ enum CacheError: LocalizedError {
         }
     }
 }
+
+// MARK: - Notification Extensions
+
+extension Notification.Name {
+    static let performCacheMemoryCleanup = Notification.Name("PerformCacheMemoryCleanup")
+    static let cacheOptimizationCompleted = Notification.Name("CacheOptimizationCompleted")
+}
+

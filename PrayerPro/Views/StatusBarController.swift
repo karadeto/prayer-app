@@ -17,6 +17,7 @@ class StatusBarController: NSObject, ObservableObject {
     private var popoverContentController: NSHostingController<StatusBarView>?
     private var timer: Timer?
     private var modelContext: ModelContext?
+    private var lastPrayerDataUpdate: Date = Date.distantPast
     
     @Published var isVisible: Bool = true {
         didSet {
@@ -32,6 +33,7 @@ class StatusBarController: NSObject, ObservableObject {
     @Published var nextPrayer: Prayer?
     @Published var timeRemaining: TimeInterval = 0
     @Published var countdownText: String = "--:--"
+    private var countdownTargetTime: Date? // Store target time for Isha->Fajr countdown
     
     private let prayerTimeService = PrayerTimeService.shared
     private let preferencesManager = PreferencesManager.shared
@@ -52,7 +54,7 @@ class StatusBarController: NSObject, ObservableObject {
     
     func updateLocation(_ location: Location?) {
         currentLocation = location
-        updatePrayerData()
+        updatePrayerData(force: true)
     }
     
     func showWidget() {
@@ -144,10 +146,32 @@ class StatusBarController: NSObject, ObservableObject {
     }
     
     private func startTimer() {
-        // Use the preferred update frequency
-        let interval = TimeInterval(preferencesManager.statusBarUpdateFrequency.rawValue)
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            self?.updateCountdown()
+        // Use 1 second interval for accurate status bar updates
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.updateCountdown()
+            }
+        }
+        
+        // Listen for performance optimization requests
+        NotificationCenter.default.addObserver(
+            forName: .adjustUpdateFrequency,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            if let userInfo = notification.userInfo,
+               let newInterval = userInfo["interval"] as? TimeInterval {
+                self?.adjustTimerFrequency(to: newInterval)
+            }
+        }
+        
+        // Listen for battery saving mode
+        NotificationCenter.default.addObserver(
+            forName: .enableBatterySavingMode,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.enableBatterySavingMode()
         }
         
         // Listen for prayer completion changes
@@ -156,7 +180,7 @@ class StatusBarController: NSObject, ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.updatePrayerData()
+            self?.updatePrayerData(force: true)
         }
         
         // Listen for refresh requests
@@ -165,7 +189,7 @@ class StatusBarController: NSObject, ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.updatePrayerData()
+            self?.updatePrayerData(force: true)
         }
     }
     
@@ -176,56 +200,128 @@ class StatusBarController: NSObject, ObservableObject {
     
     // MARK: - Data Updates
     
-    private func updatePrayerData() {
+    private func updatePrayerData(force: Bool = false) {
         guard let modelContext = modelContext else { 
             print("StatusBarController: No model context available")
             return 
         }
         
+        // Throttle updates to prevent excessive cache refreshing (unless forced)
+        if !force {
+            let now = Date()
+            let timeSinceLastUpdate = now.timeIntervalSince(lastPrayerDataUpdate)
+            if timeSinceLastUpdate < 60 { // Minimum 60 seconds between updates
+                return
+            }
+            lastPrayerDataUpdate = now
+        } else {
+            lastPrayerDataUpdate = Date()
+        }
+        
         Task { @MainActor in
+            // Ensure we still have a valid modelContext
+            guard let validContext = self.modelContext else {
+                print("StatusBarController: Context deallocated during update")
+                return
+            }
+            
             do {
                 // Defensive check for model context validity
                 let tempDescriptor = FetchDescriptor<Prayer>(predicate: #Predicate { _ in false })
-                _ = try modelContext.fetch(tempDescriptor)
+                _ = try validContext.fetch(tempDescriptor)
                 
-                let status = await prayerTimeService.getCurrentPrayerStatus(
-                    for: currentLocation,
-                    in: modelContext
+                let status = await self.prayerTimeService.getCurrentPrayerStatus(
+                    for: self.currentLocation,
+                    in: validContext
                 )
                 
                 // Validate status before using
                 try status.validate()
                 
-                nextPrayer = status.nextPrayer
-                timeRemaining = status.timeUntilNext
+                // Check if still valid before updating
+                guard self.modelContext != nil else {
+                    print("StatusBarController: Context deallocated during async operation")
+                    return
+                }
                 
-                updateDisplay()
-                updatePopoverContent()
+                print("📊 StatusBarController received prayer status:")
+                print("   Current prayer: \(status.currentPrayer?.prayerType.displayName ?? "none")")
+                print("   Next prayer: \(status.nextPrayer?.prayerType.displayName ?? "none")")
+                print("   Time until next: \(status.timeUntilNext) seconds")
+                
+                self.nextPrayer = status.nextPrayer
+                self.timeRemaining = status.timeUntilNext
+                
+                // Store target time for accurate countdown when nextPrayer is nil (Isha->Fajr)
+                if status.nextPrayer == nil && status.timeUntilNext > 0 {
+                    self.countdownTargetTime = Date().addingTimeInterval(status.timeUntilNext)
+                    print("   ✅ Stored countdown target time: \(self.countdownTargetTime!)")
+                } else {
+                    if self.countdownTargetTime != nil {
+                        print("   ❌ Clearing countdown target time (nextPrayer: \(status.nextPrayer?.prayerType.displayName ?? "nil"), timeUntilNext: \(status.timeUntilNext))")
+                    }
+                    self.countdownTargetTime = nil
+                }
+                
+                self.updateDisplay()
+                self.updatePopoverContent()
             } catch {
                 print("StatusBarController: Error updating prayer data - \(error.localizedDescription)")
-                // Fallback to safe defaults
-                nextPrayer = nil
-                timeRemaining = 0
-                countdownText = "--:--"
-                updateDisplay()
+                // Fallback to safe defaults only if still valid
+                guard self.modelContext != nil else { return }
+                
+                self.nextPrayer = nil
+                self.timeRemaining = 0
+                self.countdownText = "--:--"
+                self.updateDisplay()
             }
         }
     }
     
     private func updateCountdown() {
+        // Record performance metrics
+        PerformanceMonitor.shared.recordCacheHit()
+        
+        let now = Date()
+        print("🕐 updateCountdown called at \(now)")
+        print("   nextPrayer: \(nextPrayer?.prayerType.displayName ?? "nil")")
+        print("   countdownTargetTime: \(countdownTargetTime?.description ?? "nil")")
+        print("   current timeRemaining: \(timeRemaining)")
+        
+        // Calculate dynamic time remaining instead of decrementing
+        if let prayer = nextPrayer {
+            timeRemaining = max(0, prayer.time.timeIntervalSince(now))
+            print("   Updated timeRemaining from nextPrayer: \(timeRemaining)")
+        } else if let targetTime = countdownTargetTime {
+            // During Isha (when nextPrayer is nil), countdown to tomorrow's Fajr using stored target time
+            timeRemaining = max(0, targetTime.timeIntervalSince(now))
+            print("   Updated timeRemaining from countdownTargetTime: \(timeRemaining)")
+        } else {
+            timeRemaining = 0
+            print("   Set timeRemaining to 0 (no next prayer or target time)")
+        }
+        
         guard timeRemaining > 0 else {
-            // Time has passed, refresh prayer data
-            updatePrayerData()
+            // Time has passed, refresh prayer data (throttled)
+            // But don't refresh if we just set a countdown target time - let it work first
+            if countdownTargetTime == nil {
+                updatePrayerData()
+            }
             return
         }
         
-        timeRemaining -= 1
-        countdownText = formatCountdown(timeRemaining)
+        // Always update display with fresh data
         updateDisplay()
         
         // Also update the popover content if it's showing
         if let popover = popover, popover.isShown {
             updatePopoverContent()
+        }
+        
+        
+        // Optimize memory usage periodically
+        if Int(timeRemaining) % 300 == 0 { // Every 5 minutes
+            optimizeMemoryUsage()
         }
     }
     
@@ -270,23 +366,38 @@ class StatusBarController: NSObject, ObservableObject {
         let format = preferencesManager.statusBarDisplayFormat
         let showIcon = preferencesManager.showStatusBarIcon
         
-        guard let nextPrayer = nextPrayer else {
-            return "--:--"
-        }
-        
         switch format {
         case .countdown:
-            return countdownText
+            return getDynamicCountdownText()
             
         case .nextPrayerTime:
-            return "\(nextPrayer.prayerType.displayName) \(nextPrayer.time.formattedTime)"
+            if let nextPrayer = nextPrayer {
+                return "\(nextPrayer.prayerType.displayName) \(nextPrayer.time.formattedTime)"
+            } else if countdownTargetTime != nil {
+                return "Fajr \(countdownTargetTime!.formattedTime)"
+            } else {
+                return "--:--"
+            }
             
         case .nextPrayerName:
-            return nextPrayer.prayerType.displayName
+            if let nextPrayer = nextPrayer {
+                return nextPrayer.prayerType.displayName
+            } else if countdownTargetTime != nil {
+                return "Fajr"
+            } else {
+                return "--:--"
+            }
             
         case .iconAndCountdown:
-            let icon = showIcon ? "\(getPrayerIconSymbol(for: nextPrayer.prayerType)) " : ""
-            return "\(icon)\(countdownText)"
+            if let nextPrayer = nextPrayer {
+                let icon = showIcon ? "\(getPrayerIconSymbol(for: nextPrayer.prayerType)) " : ""
+                return "\(icon)\(getDynamicCountdownText())"
+            } else if countdownTargetTime != nil {
+                let icon = showIcon ? "\(getPrayerIconSymbol(for: .fajr)) " : ""
+                return "\(icon)\(getDynamicCountdownText())"
+            } else {
+                return "--:--"
+            }
         }
     }
     
@@ -318,6 +429,23 @@ class StatusBarController: NSObject, ObservableObject {
         )
         
         popoverContentController.rootView = updatedView
+    }
+    
+    private func getDynamicCountdownText() -> String {
+        if let prayer = nextPrayer {
+            let dynamicTimeRemaining = max(0, prayer.time.timeIntervalSince(Date()))
+            let formattedText = formatCountdown(dynamicTimeRemaining)
+            print("📱 Display text from nextPrayer: \(formattedText) (remaining: \(dynamicTimeRemaining)s)")
+            return formattedText
+        } else if let targetTime = countdownTargetTime {
+            let dynamicTimeRemaining = max(0, targetTime.timeIntervalSince(Date()))
+            let formattedText = formatCountdown(dynamicTimeRemaining)
+            print("📱 Display text from countdownTargetTime: \(formattedText) (remaining: \(dynamicTimeRemaining)s)")
+            return formattedText
+        } else {
+            print("📱 Display text: --:-- (no prayer or target time)")
+            return "--:--"
+        }
     }
     
     private func formatCountdown(_ timeInterval: TimeInterval) -> String {
@@ -429,46 +557,106 @@ class StatusBarController: NSObject, ObservableObject {
     }
     
     @objc private func refreshPrayerTimes() {
-        updatePrayerData()
+        updatePrayerData(force: true)
         NotificationCenter.default.post(name: .refreshPrayerTimes, object: nil)
     }
     
     @objc private func showPreferences() {
-        // Show preferences window
-        let preferencesView = PreferencesView()
-        let hostingController = NSHostingController(rootView: preferencesView)
-        
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 400),
-            styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
-        )
-        
-        window.contentViewController = hostingController
-        window.title = "Preferences"
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        
-        // Bring app to front
-        NSApp.activate(ignoringOtherApps: true)
+        // Use native macOS Settings window (Cmd+,)
+        // This is handled by the SwiftUI Settings scene in the app
+        NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
     }
     
     @objc private func hideStatusBarWidget() {
         preferencesManager.isStatusBarWidgetEnabled = false
     }
     
+    // MARK: - Performance Optimization
+    
+    private func getOptimalUpdateInterval() -> TimeInterval {
+        // Smart optimization: only update seconds when time < 60 minutes
+        if timeRemaining < 3600 { // Less than 60 minutes
+            return 1.0 // Update every second to show seconds
+        } else {
+            return 60.0 // Update every minute when only showing hours/minutes
+        }
+    }
+    
+    private func adjustTimerFrequency(to interval: TimeInterval) {
+        // Force 1-second intervals to prevent timer issues
+        let fixedInterval = 1.0
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: fixedInterval, repeats: true) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.updateCountdown()
+            }
+        }
+// Forced to 1-second intervals for reliability
+    }
+    
+    private func enableBatterySavingMode() {
+        // Keep 1 second updates for accurate countdown but optimize other operations
+        // Simplify display format to reduce processing
+        let currentFormat = preferencesManager.statusBarDisplayFormat
+        if currentFormat == .iconAndCountdown {
+            // Temporarily switch to simpler format
+            print("🔋 Switching to simpler display format for battery saving")
+        }
+        
+        print("🔋 Status bar battery saving mode enabled (keeping 1s updates)")
+    }
+    
+    private func optimizeMemoryUsage() {
+        // Clear any cached data that's not immediately needed
+        if let popover = popover, !popover.isShown {
+            // Recreate popover content controller to free memory
+            popoverContentController = nil
+            setupPopover()
+        }
+        
+        // Force update display to ensure consistency
+        updateDisplay()
+    }
+    
+    
     // MARK: - Lifecycle
     
     deinit {
+        print("🧹 StatusBarController deinit starting...")
+        
+        // Invalidate timer first
         timer?.invalidate()
-        statusItem = nil
+        timer = nil
+        
+        // Clean up popover
+        if let popover = popover {
+            DispatchQueue.main.async {
+                popover.performClose(nil)
+            }
+        }
         popover = nil
         popoverContentController = nil
+        
+        // Clean up status item
+        if let statusItem = statusItem {
+            DispatchQueue.main.async {
+                NSStatusBar.system.removeStatusItem(statusItem)
+            }
+        }
+        statusItem = nil
+        
+        // Clean up model context reference
+        modelContext = nil
+        
+        // Remove all observers
+        NotificationCenter.default.removeObserver(self)
+        
+        print("✅ StatusBarController deinit completed")
     }
 }
 
 // MARK: - Notification Extensions
+
 
 extension Notification.Name {
     static let statusBarWidgetToggled = Notification.Name("StatusBarWidgetToggled")

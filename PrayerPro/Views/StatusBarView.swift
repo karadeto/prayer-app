@@ -17,6 +17,8 @@ struct StatusBarView: View {
     @State private var todaysPrayers: [Prayer] = []
     @State private var isLoading = false
     @State private var errorMessage: String?
+    @State private var refreshTimer: Timer?
+    @State private var timerTick: Date = Date()
     
     private let prayerTimeService = PrayerTimeService.shared
     
@@ -45,8 +47,33 @@ struct StatusBarView: View {
         .background(Color(NSColor.clear))
         .onAppear {
             loadTodaysPrayers()
+            startRefreshTimer()
+        }
+        .onDisappear {
+            stopRefreshTimer()
+        }
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+            // Update timer tick every second for synchronized countdown
+            let remaining = calculateDynamicTimeRemaining()
+            if remaining < 3600 { // Show seconds when < 60 minutes
+                timerTick = Date()
+            }
+        }
+        .onReceive(Timer.publish(every: 60, on: .main, in: .common).autoconnect()) { _ in
+            // Always update every minute
+            timerTick = Date()
         }
         .onChange(of: currentLocation) { _, _ in
+            loadTodaysPrayers()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .prayerCompletionChanged)) { notification in
+            // Update only the specific prayer that changed, don't reload all data
+            if let changedPrayer = notification.object as? Prayer {
+                updatePrayerInList(changedPrayer)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .refreshPrayerTimes)) { _ in
+            // Refresh when explicitly requested
             loadTodaysPrayers()
         }
     }
@@ -87,6 +114,12 @@ struct StatusBarView: View {
             // Next Prayer Countdown
             if let nextPrayer = nextPrayer {
                 nextPrayerView(nextPrayer)
+                
+                Divider()
+                    .padding(.horizontal)
+            } else if timeRemaining > 0 {
+                // During Isha - show countdown to tomorrow's Fajr
+                tomorrowFajrView()
                 
                 Divider()
                     .padding(.horizontal)
@@ -135,11 +168,52 @@ struct StatusBarView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                     
-                    Text(timeRemaining.formattedCountdown)
+                    Text(calculateDynamicTimeRemaining().formattedCountdown)
                         .font(.title2)
                         .fontWeight(.bold)
                         .foregroundColor(.primary)
                         .monospacedDigit()
+                        .id(timerTick)
+                }
+            }
+        }
+        .padding()
+        .background(Color.accentColor.opacity(0.1))
+    }
+    
+    private func tomorrowFajrView() -> some View {
+        VStack(spacing: 8) {
+            HStack {
+                Text("Next Prayer")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+            }
+            
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Fajr")
+                        .font(.title2)
+                        .fontWeight(.semibold)
+                    
+                    Text("Tomorrow")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                
+                Spacer()
+                
+                VStack(alignment: .trailing, spacing: 4) {
+                    Text("in")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    
+                    Text(calculateDynamicTimeRemaining().formattedCountdown)
+                        .font(.title2)
+                        .fontWeight(.bold)
+                        .foregroundColor(.primary)
+                        .monospacedDigit()
+                        .id(timerTick)
                 }
             }
         }
@@ -167,16 +241,21 @@ struct StatusBarView: View {
                 .foregroundColor(.secondary)
                 .monospacedDigit()
             
-            // Completion status
-            Image(systemName: prayer.isCompleted ? "checkmark.circle.fill" : "circle")
-                .foregroundColor(prayer.isCompleted ? .green : .secondary)
-                .font(.system(size: 16))
+            // Completion status - only show for actual prayers, not sunrise
+            if prayer.prayerType != .sunrise {
+                Image(systemName: prayer.isCompleted ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(prayer.isCompleted ? .green : .secondary)
+                    .font(.system(size: 16))
+            }
         }
         .padding(.horizontal)
         .padding(.vertical, 8)
         .contentShape(Rectangle())
         .onTapGesture {
-            togglePrayerCompletion(prayer)
+            // Only allow toggling for actual prayers, not sunrise
+            if prayer.prayerType != .sunrise {
+                togglePrayerCompletion(prayer)
+            }
         }
     }
     
@@ -235,6 +314,13 @@ struct StatusBarView: View {
     
     // MARK: - Data Loading
     
+    private func updatePrayerInList(_ changedPrayer: Prayer) {
+        // Find and update the specific prayer in our list without reloading everything
+        if let index = todaysPrayers.firstIndex(where: { $0.id == changedPrayer.id }) {
+            todaysPrayers[index] = changedPrayer
+        }
+    }
+    
     private func loadTodaysPrayers() {
         guard let location = currentLocation else {
             todaysPrayers = []
@@ -250,7 +336,7 @@ struct StatusBarView: View {
                 let todaysOnly = prayerTimeService.getTodaysPrayers(from: prayers)
                 
                 await MainActor.run {
-                    todaysPrayers = todaysOnly.sorted { $0.time < $1.time }
+                    todaysPrayers = todaysOnly.filter { $0.prayerType != .sunrise }.sorted { $0.time < $1.time }
                     isLoading = false
                 }
             } catch {
@@ -263,6 +349,37 @@ struct StatusBarView: View {
         }
     }
     
+    // MARK: - Timer Management
+    
+    private func startRefreshTimer() {
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            // Force view refresh every second for countdown updates
+            Task { @MainActor in
+                // Update a state variable to trigger view refresh
+                timerTick = Date()
+            }
+        }
+    }
+    
+    private func stopRefreshTimer() {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+    }
+    
+    // MARK: - Helper Methods
+    
+    private func calculateDynamicTimeRemaining() -> TimeInterval {
+        // Create a temporary status to use the centralized calculation
+        let status = PrayerStatus(
+            currentPrayer: nil,
+            nextPrayer: nextPrayer,
+            timeUntilNext: timeRemaining,
+            timeUntilCurrentEnds: timeRemaining,
+            allPrayers: todaysPrayers
+        )
+        return prayerTimeService.getDynamicTimeRemaining(for: status, prayers: todaysPrayers)
+    }
+    
     // MARK: - Actions
     
     private func togglePrayerCompletion(_ prayer: Prayer) {
@@ -272,13 +389,9 @@ struct StatusBarView: View {
             do {
                 try await completionManager.togglePrayerCompletion(prayer, in: modelContext)
                 
-                // Refresh the prayer list to show updated completion status
-                loadTodaysPrayers()
+                // The completion manager will now broadcast the change
+                // and all views will refresh automatically
                 
-                // Notify main app of the change
-                await MainActor.run {
-                    NotificationCenter.default.post(name: .prayerCompleted, object: prayer)
-                }
             } catch {
                 print("Failed to toggle prayer completion: \(error.localizedDescription)")
             }

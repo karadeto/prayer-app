@@ -7,6 +7,7 @@
 
 import SwiftUI
 import SwiftData
+import OSLog
 
 @main
 struct PrayerProApp: App {
@@ -18,8 +19,19 @@ struct PrayerProApp: App {
     // Preferences manager
     @StateObject private var preferencesManager = PreferencesManager.shared
     
+    // Data persistence service
+    @StateObject private var dataPersistenceService = DataPersistenceService.shared
+    
+    // Session manager
+    @StateObject private var sessionManager = SessionManager.shared
+    
+    // Error handling service
+    @StateObject private var errorHandlingService = ErrorHandlingService.shared
+    
     // App delegate for lifecycle management
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    
+    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "PrayerPro", category: "App")
     
     var body: some Scene {
         WindowGroup {
@@ -28,16 +40,44 @@ struct PrayerProApp: App {
                 .frame(minWidth: 700, minHeight: 500)
                 .onAppear {
                     configureWindow()
-                    setupStatusBarWidget()
-                    setupNotificationSystem()
-                    setupiCloudSync()
+                    setupNetworkMonitoring()
+                    
+                    // Setup data persistence first before other services
+                    setupDataPersistence()
+                    
+                    // Add delay before setting up other services that depend on SwiftData
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        setupStatusBarWidget()
+                        setupNotificationSystem()
+                        setupiCloudSync()
+                    }
                 }
                 .environmentObject(statusBarController)
                 .environmentObject(preferencesManager)
+                .environmentObject(dataPersistenceService)
+                .environmentObject(sessionManager)
+                .environmentObject(errorHandlingService)
+                .withErrorHandling()
+                .onReceive(NotificationCenter.default.publisher(for: .refreshAllData)) { _ in
+                    refreshAllData()
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .resetAppData)) { _ in
+                    resetAppData()
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unified)
         .defaultSize(width: 900, height: 650)
+        .windowResizability(.contentSize)
+        
+        // Native SwiftUI Settings window
+        Settings {
+            PreferencesView()
+                .modelContainer(persistenceController.modelContainer)
+                .environmentObject(preferencesManager)
+                .environmentObject(statusBarController)
+        }
+        
         .commands {
             // Add custom menu commands
             CommandGroup(replacing: .newItem) {
@@ -45,13 +85,6 @@ struct PrayerProApp: App {
                     // This will be handled by the UI
                 }
                 .keyboardShortcut("n", modifiers: .command)
-            }
-            
-            CommandGroup(replacing: .appSettings) {
-                Button("Preferences...") {
-                    showPreferences()
-                }
-                .keyboardShortcut(",", modifiers: .command)
             }
             
             CommandGroup(after: .toolbar) {
@@ -73,7 +106,6 @@ struct PrayerProApp: App {
                 .keyboardShortcut("w", modifiers: [.command, .shift])
             }
         }
-        .windowResizability(.contentSize)
     }
     
     private func configureWindow() {
@@ -93,25 +125,102 @@ struct PrayerProApp: App {
             
             // Set window identifier for status bar controller
             window.identifier = NSUserInterfaceItemIdentifier("MainWindow")
+            
+            // Restore window frame from session if available
+            if let savedFrame = sessionManager.windowFrame {
+                window.setFrame(savedFrame, display: true)
+            }
+            
+            // Listen for window frame changes to save to session
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.didResizeNotification,
+                object: window,
+                queue: .main
+            ) { _ in
+                self.sessionManager.updateWindowFrame(window.frame)
+            }
+            
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.didMoveNotification,
+                object: window,
+                queue: .main
+            ) { _ in
+                self.sessionManager.updateWindowFrame(window.frame)
+            }
+        }
+    }
+    
+    private func setupNetworkMonitoring() {
+        // Initialize network monitoring early
+        let _ = NetworkOptimizer.shared
+        logger.info("✅ Network monitoring initialized")
+        
+        // Give it a moment to detect network status
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            self.errorHandlingService.updateSystemAvailability()
+        }
+    }
+    
+    private func setupDataPersistence() {
+        // Initialize data persistence service
+        Task {
+            do {
+                await dataPersistenceService.initialize(with: persistenceController.modelContainer.mainContext)
+                
+                // Check session info and handle accordingly
+                let sessionInfo = dataPersistenceService.getSessionInfo()
+                
+                if sessionInfo.isFresh {
+                    logger.info("🆕 Fresh app launch - showing welcome experience")
+                    // Could show onboarding or welcome screen
+                } else if sessionInfo.hasVersionChanged {
+                    logger.info("🔄 App version changed - checking for migration")
+                    // Migration was already handled in initialize
+                } else if sessionInfo.isStale {
+                    logger.info("⏰ Session is stale - refreshing data")
+                    // Could trigger data refresh
+                }
+                
+                // Restore last selected location
+                if let lastLocation = await dataPersistenceService.restoreLastSelectedLocation() {
+                    logger.info("📍 Restored last selected location: \(lastLocation.name)")
+                    // Notify UI components about restored location
+                    NotificationCenter.default.post(
+                        name: Notification.Name("LocationSelected"),
+                        object: lastLocation,
+                        userInfo: nil
+                    )
+                }
+                
+                logger.info("✅ Data persistence setup completed")
+            } catch {
+                errorHandlingService.handleError(error, context: "setupDataPersistence", showToUser: true)
+            }
         }
     }
     
     private func setupStatusBarWidget() {
-        // Configure status bar widget with model context
-        statusBarController.configure(with: persistenceController.modelContainer.mainContext)
-        
-        // Set initial visibility based on preferences
-        statusBarController.isVisible = preferencesManager.isStatusBarWidgetEnabled
-        
-        // Listen for location changes to update status bar
-        NotificationCenter.default.addObserver(
-            forName: .locationSelected,
-            object: nil,
-            queue: .main
-        ) { notification in
-            if let location = notification.object as? Location {
-                statusBarController.updateLocation(location)
+        do {
+            // Configure status bar widget with model context
+            statusBarController.configure(with: persistenceController.modelContainer.mainContext)
+            
+            // Set initial visibility based on preferences
+            statusBarController.isVisible = preferencesManager.isStatusBarWidgetEnabled
+            
+            // Listen for location changes to update status bar
+            NotificationCenter.default.addObserver(
+                forName: Notification.Name("LocationSelected"),
+                object: nil,
+                queue: .main
+            ) { notification in
+                if let location = notification.object as? Location {
+                    statusBarController.updateLocation(location)
+                }
             }
+            
+            logger.info("✅ Status bar widget setup completed")
+        } catch {
+            errorHandlingService.handleError(error, context: "setupStatusBarWidget", showToUser: false)
         }
     }
     
@@ -121,7 +230,7 @@ struct PrayerProApp: App {
         let notificationScheduler = NotificationScheduler.shared
         
         // Request notification permission on first launch
-        Task {
+        Task { @MainActor in
             await notificationManager.updatePermissionStatus()
             
             // If notifications are enabled but permission not granted, request it
@@ -138,7 +247,7 @@ struct PrayerProApp: App {
         
         // Listen for preference changes to update notifications
         NotificationCenter.default.addObserver(
-            forName: .notificationPreferencesChanged,
+            forName: Notification.Name("NotificationPreferencesChanged"),
             object: nil,
             queue: .main
         ) { _ in
@@ -149,7 +258,7 @@ struct PrayerProApp: App {
         
         // Listen for prayer times requests from notification system
         NotificationCenter.default.addObserver(
-            forName: .requestPrayerTimesForNotifications,
+            forName: Notification.Name("RequestPrayerTimesForNotifications"),
             object: nil,
             queue: .main
         ) { _ in
@@ -197,6 +306,9 @@ struct PrayerProApp: App {
     private func setupiCloudSync() {
         // Initialize iCloud sync service with proper error handling
         Task {
+            // Add delay to ensure SwiftData is fully initialized
+            try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second delay
+            
             do {
                 print("🔄 Initializing iCloud sync...")
                 
@@ -206,11 +318,36 @@ struct PrayerProApp: App {
                 // Verify CloudKit schema
                 try await CloudKitSchemaHelper.verifySchema()
                 
-                // Perform initial sync from iCloud
-                try await iCloudSyncService.shared.syncCompletionsFromiCloud(in: persistenceController.modelContainer.mainContext)
-                
-                // Sync any unsynced local completions
-                try await PrayerCompletionManager.shared.syncUnsyncedCompletions(in: persistenceController.modelContainer.mainContext)
+                // Ensure we're on main actor for SwiftData access
+                await MainActor.run {
+                    Task {
+                        do {
+                            print("🚀 Starting iCloud sync data operations...")
+                            
+                            // Perform initial sync from iCloud
+                            print("📥 Syncing completions from iCloud...")
+                            try await iCloudSyncService.shared.syncCompletionsFromiCloud(in: persistenceController.modelContainer.mainContext)
+                            
+                            // Sync any unsynced local completions
+                            print("📤 Syncing unsynced local completions...")
+                            try await PrayerCompletionManager.shared.syncUnsyncedCompletions(in: persistenceController.modelContainer.mainContext)
+                            
+                            // Restore completion states for all prayers after sync
+                            print("🔄 Restoring completion states...")
+                            try await PrayerCompletionManager.shared.restoreAllCompletionStates(in: persistenceController.modelContainer.mainContext)
+                            
+                            print("✅ iCloud sync data operations completed successfully")
+                            
+                            // Notify other parts of the app that sync is complete
+                            NotificationCenter.default.post(
+                                name: Notification.Name("iCloudSyncCompleted"),
+                                object: nil
+                            )
+                        } catch {
+                            print("⚠️ iCloud sync data operations failed: \(error)")
+                        }
+                    }
+                }
                 
                 print("✅ iCloud sync initialized successfully")
                 
@@ -237,14 +374,39 @@ struct PrayerProApp: App {
                 // Continue without iCloud sync - app should still function
                 print("📱 App will continue to function with local data only")
                 
+                // Still try to restore completion states from local data
+                await MainActor.run {
+                    Task {
+                        do {
+                            try await PrayerCompletionManager.shared.restoreAllCompletionStates(in: persistenceController.modelContainer.mainContext)
+                        } catch {
+                            print("⚠️ Failed to restore completion states from local data: \(error)")
+                        }
+                    }
+                }
+                
             } catch {
                 print("⚠️ iCloud sync initialization failed: \(error.localizedDescription)")
                 print("📱 App will continue to function with local data only")
+                
+                // Still try to restore completion states from local data
+                await MainActor.run {
+                    Task {
+                        do {
+                            try await PrayerCompletionManager.shared.restoreAllCompletionStates(in: persistenceController.modelContainer.mainContext)
+                        } catch {
+                            print("⚠️ Failed to restore completion states from local data: \(error)")
+                        }
+                    }
+                }
             }
         }
         
         // Set up periodic sync (only if iCloud is available)
         setupPeriodicSync()
+        
+        // Set up periodic cleanup
+        setupPeriodicCleanup()
     }
     
     private func setupPeriodicSync() {
@@ -304,23 +466,99 @@ struct PrayerProApp: App {
         }
     }
     
-    private func showPreferences() {
-        let preferencesView = PreferencesView()
-        let hostingController = NSHostingController(rootView: preferencesView)
+    // Settings window is now handled natively by SwiftUI Settings scene
+    
+    private func setupPeriodicCleanup() {
+        // Perform cleanup every 24 hours
+        Timer.scheduledTimer(withTimeInterval: 24 * 60 * 60, repeats: true) { _ in
+            Task {
+                do {
+                    try await self.dataPersistenceService.performCleanup()
+                    print("✅ Periodic cleanup completed successfully")
+                } catch {
+                    print("⚠️ Periodic cleanup failed: \(error)")
+                }
+            }
+        }
         
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 400),
-            styleMask: [.titled, .closable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
+        // Perform cleanup when app becomes active (if it's been more than 24 hours)
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            Task {
+                do {
+                    let healthReport = try await self.dataPersistenceService.getSystemHealthReport()
+                    
+                    // Perform cleanup if needed
+                    if healthReport.needsMaintenance {
+                        print("🧹 System needs maintenance, performing cleanup...")
+                        try await self.dataPersistenceService.performCleanup()
+                        print("✅ Maintenance cleanup completed")
+                    }
+                } catch {
+                    print("⚠️ Health check or cleanup failed: \(error)")
+                }
+            }
+        }
+    }
+    
+    private func refreshAllData() {
+        logger.info("🔄 Refreshing all app data")
         
-        window.contentViewController = hostingController
-        window.title = "Preferences"
-        window.center()
-        window.makeKeyAndOrderFront(nil)
+        Task {
+            do {
+                // Clear caches
+                await CacheManager.shared.performMemoryCleanup()
+                
+                // Update system availability
+                errorHandlingService.updateSystemAvailability()
+                
+                // Refresh current location and prayer times if available
+                NotificationCenter.default.post(name: .refreshPrayerTimes, object: nil)
+                
+                logger.info("✅ Data refresh completed")
+            } catch {
+                errorHandlingService.handleError(error, context: "refreshAllData", showToUser: true)
+            }
+        }
+    }
+    
+    private func resetAppData() {
+        logger.warning("⚠️ Resetting all app data")
         
-        // Bring app to front
-        NSApp.activate(ignoringOtherApps: true)
+        Task {
+            do {
+                // Clear all caches
+                await CacheManager.shared.performMemoryCleanup()
+                
+                // Clear user defaults
+                let domain = Bundle.main.bundleIdentifier!
+                UserDefaults.standard.removePersistentDomain(forName: domain)
+                UserDefaults.standard.synchronize()
+                
+                // Clear error logs
+                errorHandlingService.clearErrorLog()
+                
+                // Reset preferences
+                preferencesManager.resetAllPreferences()
+                
+                logger.info("✅ App data reset completed")
+                
+                // Show success message
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    let alert = NSAlert()
+                    alert.messageText = "Data Reset Complete"
+                    alert.informativeText = "All app data has been reset. Please restart the app to apply changes."
+                    alert.alertStyle = .informational
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                }
+                
+            } catch {
+                errorHandlingService.handleError(error, context: "resetAppData", showToUser: true)
+            }
+        }
     }
 }

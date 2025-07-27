@@ -70,7 +70,7 @@ class NetworkMonitor {
     
     private func startMonitoring() {
         monitor.pathUpdateHandler = { [weak self] path in
-            Task { @MainActor in
+            DispatchQueue.main.async {
                 self?.isConnected = path.status == .satisfied
                 self?.connectionType = path.availableInterfaces.first?.type
             }
@@ -111,6 +111,8 @@ class DiyanetAPIClient {
     private let session: URLSession
     private let networkMonitor = NetworkMonitor()
     private let retryConfig = RetryConfiguration.default
+    private let networkOptimizer = NetworkOptimizer.shared
+    private let performanceMonitor = PerformanceMonitor.shared
     
     // Request timeout configuration - reduced for better UX
     private let requestTimeout: TimeInterval = 15.0
@@ -143,32 +145,52 @@ class DiyanetAPIClient {
         let dateString = date?.toISO8601DateString()
         let request = DailyPrayerTimesRequest(locationId: locationId, date: dateString, method: method)
         
-        let url = try buildURL(path: "/api/prayer-times/daily", queryItems: request.queryItems)
-        return try await performRequest(url: url, responseType: DailyPrayerScheduleResponse.self)
+        do {
+            let url = try buildURL(path: "/api/prayer-times/daily", queryItems: request.queryItems)
+            return try await performRequest(url: url, responseType: DailyPrayerScheduleResponse.self)
+        } catch {
+            ErrorLogger.shared.logNetworkError(error, request: "fetchDailyPrayerTimes(locationId: \(locationId))")
+            throw error
+        }
     }
     
     /// Fetch annual prayer times for a location
     func fetchAnnualPrayerTimes(locationId: String, year: Int? = nil) async throws -> AnnualPrayerDataResponse {
         let request = AnnualPrayerTimesRequest(locationId: locationId, year: year)
         
-        let url = try buildURL(path: "/api/prayer-times/annual", queryItems: request.queryItems)
-        return try await performRequest(url: url, responseType: AnnualPrayerDataResponse.self)
+        do {
+            let url = try buildURL(path: "/api/prayer-times/annual", queryItems: request.queryItems)
+            return try await performRequest(url: url, responseType: AnnualPrayerDataResponse.self)
+        } catch {
+            ErrorLogger.shared.logNetworkError(error, request: "fetchAnnualPrayerTimes(locationId: \(locationId))")
+            throw error
+        }
     }
     
     /// Search for locations by name
     func searchLocations(query: String, limit: Int? = nil) async throws -> LocationSearchResponse {
         let request = LocationSearchRequest(query: query, limit: limit)
         
-        let url = try buildURL(path: "/api/locations/search", queryItems: request.queryItems)
-        return try await performRequest(url: url, responseType: LocationSearchResponse.self)
+        do {
+            let url = try buildURL(path: "/api/locations/search", queryItems: request.queryItems)
+            return try await performRequest(url: url, responseType: LocationSearchResponse.self)
+        } catch {
+            ErrorLogger.shared.logNetworkError(error, request: "searchLocations(query: \(query))")
+            throw error
+        }
     }
     
     /// Reverse geocode coordinates to find nearest location
     func reverseGeocode(latitude: Double, longitude: Double) async throws -> LocationDataResponse {
         let request = ReverseGeocodeRequest(latitude: latitude, longitude: longitude)
         
-        let url = try buildURL(path: "/api/locations/reverse-geocode")
-        return try await performRequest(url: url, method: "POST", body: request, responseType: LocationDataResponse.self)
+        do {
+            let url = try buildURL(path: "/api/locations/reverse-geocode")
+            return try await performRequest(url: url, method: "POST", body: request, responseType: LocationDataResponse.self)
+        } catch {
+            ErrorLogger.shared.logNetworkError(error, request: "reverseGeocode(lat: \(latitude), lng: \(longitude))")
+            throw error
+        }
     }
     
     // MARK: - Private Helper Methods
@@ -252,6 +274,9 @@ class DiyanetAPIClient {
         body: (any Codable)?,
         responseType: T.Type
     ) async throws -> T {
+        // Record network request for performance monitoring
+        performanceMonitor.recordNetworkRequest()
+        
         var request = URLRequest(url: url)
         request.httpMethod = method
         
@@ -261,6 +286,14 @@ class DiyanetAPIClient {
                 request.httpBody = try JSONEncoder().encode(body)
             } catch {
                 throw DiyanetAPIError.decodingError(error)
+            }
+        }
+        
+        // Check if we should defer the request for optimization
+        if networkOptimizer.shouldDeferRequest() {
+            let delay = networkOptimizer.getOptimalRequestDelay()
+            if delay > 0 {
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }
         }
         

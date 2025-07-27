@@ -150,7 +150,7 @@ class PreferencesManager: ObservableObject {
         didSet {
             userDefaults.set(notificationsEnabled, forKey: Keys.notificationsEnabled)
             NotificationCenter.default.post(
-                name: .notificationPreferencesChanged,
+                name: Notification.Name("NotificationPreferencesChanged"),
                 object: nil,
                 userInfo: ["notificationsEnabled": notificationsEnabled]
             )
@@ -162,7 +162,7 @@ class PreferencesManager: ObservableObject {
             let rawValues = enabledPrayerNotifications.map { $0.rawValue }
             userDefaults.set(rawValues, forKey: Keys.enabledPrayerNotifications)
             NotificationCenter.default.post(
-                name: .notificationPreferencesChanged,
+                name: Notification.Name("NotificationPreferencesChanged"),
                 object: nil,
                 userInfo: ["enabledPrayerNotifications": enabledPrayerNotifications]
             )
@@ -177,7 +177,7 @@ class PreferencesManager: ObservableObject {
                 userDefaults.removeObject(forKey: Keys.notificationLocationId)
             }
             NotificationCenter.default.post(
-                name: .notificationPreferencesChanged,
+                name: Notification.Name("NotificationPreferencesChanged"),
                 object: nil,
                 userInfo: ["notificationLocationId": notificationLocationId]
             )
@@ -188,7 +188,7 @@ class PreferencesManager: ObservableObject {
         didSet {
             userDefaults.set(useGPSForNotifications, forKey: Keys.useGPSForNotifications)
             NotificationCenter.default.post(
-                name: .notificationPreferencesChanged,
+                name: Notification.Name("NotificationPreferencesChanged"),
                 object: nil,
                 userInfo: ["useGPSForNotifications": useGPSForNotifications]
             )
@@ -199,7 +199,7 @@ class PreferencesManager: ObservableObject {
         didSet {
             userDefaults.set(notificationAdvanceMinutes, forKey: Keys.notificationAdvanceMinutes)
             NotificationCenter.default.post(
-                name: .notificationPreferencesChanged,
+                name: Notification.Name("NotificationPreferencesChanged"),
                 object: nil,
                 userInfo: ["notificationAdvanceMinutes": notificationAdvanceMinutes]
             )
@@ -210,7 +210,7 @@ class PreferencesManager: ObservableObject {
         didSet {
             userDefaults.set(notificationSound, forKey: Keys.notificationSound)
             NotificationCenter.default.post(
-                name: .notificationPreferencesChanged,
+                name: Notification.Name("NotificationPreferencesChanged"),
                 object: nil,
                 userInfo: ["notificationSound": notificationSound]
             )
@@ -226,12 +226,26 @@ class PreferencesManager: ObservableObject {
             } else {
                 userDefaults.removeObject(forKey: Keys.selectedLocationId)
             }
+            
+            // Update session manager
+            NotificationCenter.default.post(
+                name: Notification.Name("SelectedLocationChanged"),
+                object: nil,
+                userInfo: ["locationId": selectedLocationId as Any]
+            )
         }
     }
     
     @Published var useGPSLocation: Bool {
         didSet {
             userDefaults.set(useGPSLocation, forKey: Keys.useGPSLocation)
+            
+            // Update session manager
+            NotificationCenter.default.post(
+                name: Notification.Name("UseGPSLocationChanged"),
+                object: nil,
+                userInfo: ["useGPS": useGPSLocation]
+            )
         }
     }
     

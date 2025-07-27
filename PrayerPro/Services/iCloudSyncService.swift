@@ -39,15 +39,30 @@ class iCloudSyncService: ObservableObject {
     /// Ensures CloudKit schema is properly configured
     func setupCloudKitSchema() async throws {
         // This would typically be done through CloudKit Dashboard
-        // But we can verify the schema exists by attempting to fetch
+        // But we can verify the schema exists by attempting a simple operation
         do {
-            // Use a simple predicate that CloudKit can handle
-            let query = CKQuery(recordType: "PrayerCompletion", predicate: NSPredicate(value: true))
+            // Try a simple fetch operation with no specific query requirements
+            let query = CKQuery(recordType: "PrayerCompletion", predicate: NSPredicate(value: false))
             let (_, _) = try await privateDatabase.records(matching: query, resultsLimit: 1)
             print("✅ CloudKit schema verified successfully")
-        } catch let error as CKError where error.code == .unknownItem {
-            print("❌ CloudKit schema needs to be configured in CloudKit Dashboard")
-            throw iCloudSyncError.schemaNotConfigured
+        } catch let error as CKError {
+            switch error.code {
+            case .unknownItem:
+                print("❌ CloudKit schema needs to be configured in CloudKit Dashboard")
+                throw iCloudSyncError.schemaNotConfigured
+            case .invalidArguments:
+                if error.localizedDescription.contains("queryable") {
+                    print("❌ CloudKit schema configuration issue: Some fields are not marked as queryable")
+                    print("📋 Please ensure the 'date' field is marked as queryable in CloudKit Dashboard")
+                    throw iCloudSyncError.schemaNotConfigured
+                } else {
+                    print("❌ CloudKit schema verification failed: \(error.localizedDescription)")
+                    throw error
+                }
+            default:
+                print("❌ CloudKit schema verification failed: \(error.localizedDescription)")
+                throw error
+            }
         } catch {
             print("❌ CloudKit schema verification failed: \(error)")
             throw error
@@ -126,6 +141,20 @@ class iCloudSyncService: ObservableObject {
             completion.markSyncedToiCloud()
             print("Successfully synced completion to iCloud: \(completion.prayerType.displayName)")
         } catch let error as CKError {
+            // Handle "record already exists" gracefully
+            let errorDescription = error.localizedDescription.lowercased()
+            
+            if error.code == .serverRecordChanged || 
+               error.code == .batchRequestFailed ||
+               error.code == .constraintViolation ||
+               errorDescription.contains("already exists") ||
+               errorDescription.contains("duplicate") {
+                // Record already exists in iCloud, mark local as synced
+                completion.markSyncedToiCloud()
+                print("Completion already exists in iCloud, marked as synced: \(completion.prayerType.displayName)")
+                return
+            }
+            
             print("CloudKit sync error: \(error.localizedDescription)")
             throw handleCloudKitError(error)
         }
@@ -215,35 +244,74 @@ class iCloudSyncService: ObservableObject {
     
     /// Sync completions from iCloud to local storage
     func syncCompletionsFromiCloud(in context: ModelContext) async throws {
+        print("🔄 Starting sync completions from iCloud...")
+        
         let thirtyDaysAgo = Calendar.current.date(byAdding: .day, value: -30, to: Date())!
-        let records = try await fetchCompletionsFromiCloud(from: thirtyDaysAgo, to: Date())
+        let tomorrow = Calendar.current.date(byAdding: .day, value: 1, to: Date())!
+        
+        print("📅 Fetching iCloud records from \(thirtyDaysAgo) to \(tomorrow)")
+        let records = try await fetchCompletionsFromiCloud(from: thirtyDaysAgo, to: tomorrow)
+        print("📊 Found \(records.count) records in iCloud")
         
         var newCompletions: [PrayerCompletion] = []
+        var existingCompletions: [PrayerCompletion] = []
         
         for record in records {
+            print("📝 Processing iCloud record: \(record.recordID.recordName)")
             if let completion = try? createPrayerCompletion(from: record) {
+                let dateFormatter = DateFormatter()
+                dateFormatter.dateStyle = .short
+                dateFormatter.timeStyle = .medium
+                dateFormatter.timeZone = TimeZone.current
+                
+                print("   - Created completion: \(completion.prayerType.displayName)")
+                print("   - Completion date: \(completion.date) (UTC)")
+                print("   - Completion date local: \(dateFormatter.string(from: completion.date))")
+                print("   - Completed at: \(completion.completedAt) (UTC)")
+                
                 // Check if completion already exists locally
                 let completionId = completion.id
                 let existingDescriptor = FetchDescriptor<PrayerCompletion>(
                     predicate: #Predicate<PrayerCompletion> { $0.id == completionId }
                 )
                 
-                let existingCompletions = try context.fetch(existingDescriptor)
+                let foundCompletions = try context.fetch(existingDescriptor)
                 
-                if existingCompletions.isEmpty {
+                if foundCompletions.isEmpty {
                     newCompletions.append(completion)
+                    print("   ✅ Will add as new completion")
+                } else {
+                    print("   ℹ️ Found \(foundCompletions.count) existing local completion(s)")
+                    // Mark existing completion as synced
+                    for existingCompletion in foundCompletions {
+                        if !existingCompletion.syncedToiCloud {
+                            existingCompletion.markSyncedToiCloud()
+                            existingCompletions.append(existingCompletion)
+                            print("   🔄 Marked existing completion as synced")
+                        } else {
+                            print("   ✅ Existing completion already synced")
+                        }
+                    }
                 }
+            } else {
+                print("   ❌ Failed to create completion from record")
             }
         }
         
         // Insert new completions
         for completion in newCompletions {
             context.insert(completion)
+            print("📝 Inserted new completion: \(completion.prayerType.displayName)")
         }
         
-        if !newCompletions.isEmpty {
+        if !newCompletions.isEmpty || !existingCompletions.isEmpty {
             try context.save()
-            print("Downloaded \(newCompletions.count) new completions from iCloud")
+            print("✅ Downloaded \(newCompletions.count) new completions from iCloud")
+            if !existingCompletions.isEmpty {
+                print("✅ Updated sync status for \(existingCompletions.count) existing completions")
+            }
+        } else {
+            print("ℹ️ No new completions to download from iCloud")
         }
     }
     

@@ -2,26 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>NSUserNotificationsUsageDescription</key>
+	<string>This app sends notifications to remind you of prayer times throughout the day.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>remote-notification</string>
 		<string>location</string>
 	</array>
-	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>This app needs location access to provide accurate prayer times for your current location.</string>
-	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>This app needs location access to provide accurate prayer times and send prayer time notifications.</string>
-	<key>NSUserNotificationsUsageDescription</key>
-	<string>This app sends notifications to remind you of prayer times throughout the day.</string>
-	<key>CFBundleIdentifier</key>
-	<string>com.prayerpro.app</string>
-	<key>CFBundleName</key>
-	<string>PrayerPro</string>
-	<key>CFBundleDisplayName</key>
-	<string>Prayer Times</string>
-	<key>CFBundleVersion</key>
-	<string>1.0</string>
-	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
 </dict>
 </plist>

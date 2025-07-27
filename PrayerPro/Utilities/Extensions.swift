@@ -221,6 +221,7 @@ extension Notification.Name {
     static let refreshPrayerTimes = Notification.Name("RefreshPrayerTimes")
     static let locationSelected = Notification.Name("LocationSelected")
     static let prayerCompleted = Notification.Name("PrayerCompleted")
+    static let timerUpdate = Notification.Name("TimerUpdate")
 }
 
 // MARK: - UserDefaults Extensions

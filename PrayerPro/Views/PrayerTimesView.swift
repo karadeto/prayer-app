@@ -13,18 +13,28 @@ struct PrayerTimesView: View {
     @Environment(\.modelContext) private var modelContext
     
     let selectedLocation: Location?
+    let isCurrentLocation: Bool
     
     @State private var prayers: [Prayer] = []
-    @State private var isLoading = false
+    @State private var isLoading = false {
+        didSet {
+            print("🔄 isLoading changed to: \(isLoading)")
+        }
+    }
+    @State private var hasAttemptedLoad = false
     @State private var errorMessage: String?
     @State private var showingError = false
     @State private var currentPrayerStatus: PrayerStatus?
     @State private var lastStatusUpdate: Date = Date()
     @State private var shouldUpdateStatus: Bool = true
     @State private var refreshTimer: Timer?
+    @State private var timerTick: Date = Date()
+    @State private var isWindowFocused: Bool = true
+    @State private var isLocationFavorited = false
     
     private let prayerTimeService = PrayerTimeService.shared
     private let completionManager = PrayerCompletionManager.shared
+    private let favoritesManager = FavoriteLocationsManager.shared
     
     var body: some View {
         VStack(spacing: 0) {
@@ -33,12 +43,29 @@ struct PrayerTimesView: View {
                 locationHeader(for: selectedLocation)
                 
                 // Prayer Times Content
-                if isLoading {
+                if prayers.isEmpty && !isLoading {
+                    // Check if we should load or show empty state
+                    if hasAttemptedLoad {
+                        emptyStateView
+                            .onAppear {
+                                print("📭 Empty state view appeared - isLoading: \(isLoading), prayers count: \(prayers.count)")
+                            }
+                    } else {
+                        loadingView
+                            .onAppear {
+                                print("🔄 Initial loading view appeared - prayers empty, no load attempted yet")
+                            }
+                    }
+                } else if isLoading {
                     loadingView
-                } else if prayers.isEmpty {
-                    emptyStateView
+                        .onAppear {
+                            print("🔄 Loading view appeared - isLoading: \(isLoading), prayers count: \(prayers.count)")
+                        }
                 } else {
                     prayerTimesList
+                        .onAppear {
+                            print("📋 Prayer list appeared - isLoading: \(isLoading), prayers count: \(prayers.count)")
+                        }
                 }
             }
         }
@@ -48,27 +75,99 @@ struct PrayerTimesView: View {
         } message: {
             Text(errorMessage ?? "An unknown error occurred")
         }
-        .onChange(of: selectedLocation) { _, newLocation in
+        .onChange(of: selectedLocation) { oldLocation, newLocation in
+            print("🔄 selectedLocation changed from \(oldLocation?.displayName ?? "nil") to \(newLocation?.displayName ?? "nil")")
             if let location = newLocation {
-                loadPrayerTimes(for: location)
+                // Reset hasAttemptedLoad for new selection
+                hasAttemptedLoad = false
+                
+                // Check if this location is favorited
+                Task {
+                    let isFav = await favoritesManager.isFavorite(location)
+                    await MainActor.run {
+                        self.isLocationFavorited = isFav
+                    }
+                }
+                
+                // Only reload if location actually changed
+                if oldLocation?.id != newLocation?.id {
+                    print("📍 Location changed, loading fresh data")
+                    loadPrayerTimes(for: location)
+                } else {
+                    print("📍 Same location detected, checking cache first")
+                    // Same location - try to use cached data first
+                    loadPrayerTimesFromCacheFirst(for: location)
+                }
             } else {
                 prayers = []
                 currentPrayerStatus = nil
+                hasAttemptedLoad = false
+                isLocationFavorited = false
             }
         }
         .onAppear {
+            print("👁️ PrayerTimesView appeared for location: \(selectedLocation?.displayName ?? "nil")")
             if let location = selectedLocation {
-                loadPrayerTimes(for: location)
+                print("🚀 onAppear: Loading prayer times for \(location.displayName)")
+                
+                // Check if this location is favorited
+                Task {
+                    let isFav = await favoritesManager.isFavorite(location)
+                    await MainActor.run {
+                        self.isLocationFavorited = isFav
+                    }
+                }
+                
+                // Try to load data synchronously first
+                loadPrayerTimesFromCacheFirst(for: location)
             }
             startRefreshTimer()
+            
+            // Listen for app activation/deactivation to optimize timer frequency
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: .main
+            ) { _ in
+                print("✅ App became active")
+                isWindowFocused = true
+                restartTimerWithOptimalInterval()
+            }
+            
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.didResignActiveNotification,
+                object: nil,
+                queue: .main
+            ) { _ in
+                print("❌ App resigned active")
+                isWindowFocused = false
+                restartTimerWithOptimalInterval()
+            }
         }
         .onDisappear {
             stopRefreshTimer()
+            NotificationCenter.default.removeObserver(self, name: NSApplication.didBecomeActiveNotification, object: nil)
+            NotificationCenter.default.removeObserver(self, name: NSApplication.didResignActiveNotification, object: nil)
         }
         .onReceive(NotificationCenter.default.publisher(for: .refreshPrayerTimes)) { _ in
             if let location = selectedLocation {
                 loadPrayerTimes(for: location, forceRefresh: true)
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .timerUpdate)) { notification in
+            if let userInfo = notification.object as? [String: Any],
+               let interval = userInfo["interval"] as? TimeInterval {
+                print("🎯 PrayerTimesView received timer update with interval: \(interval)s")
+            }
+            updateTimerDisplay()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .prayerCompletionChanged)) { notification in
+            // Update only the specific prayer that changed, don't reload all data
+            if let changedPrayer = notification.object as? Prayer {
+                updatePrayerInList(changedPrayer)
+            }
+            // Update prayer status for visual feedback
+            updateCurrentPrayerStatus(force: false)
         }
     }
     
@@ -100,6 +199,64 @@ struct PrayerTimesView: View {
                 }
                 
                 Spacer()
+                
+                // Action buttons for different location types
+                HStack(spacing: 8) {
+                    // Add to Favorites Button (for GPS locations that aren't favorited)
+                    if location.isGPSLocation && !isLocationFavorited {
+                        Button(action: {
+                            Task {
+                                do {
+                                    try await favoritesManager.addToFavorites(location)
+                                    await MainActor.run {
+                                        isLocationFavorited = true
+                                    }
+                                } catch {
+                                    // Handle error silently or show alert
+                                    print("Failed to add GPS location to favorites: \(error.localizedDescription)")
+                                }
+                            }
+                        }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "plus")
+                                    .font(.caption)
+                                Text("Add to Favorites")
+                                    .font(.caption)
+                                    .fontWeight(.medium)
+                            }
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.blue)
+                            .cornerRadius(6)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Save this GPS location to your favorites")
+                    }
+                    
+                    // Set as Current Location Button (for non-current locations)
+                    if !isCurrentLocation {
+                        Button(action: {
+                            // Send notification to set this location as current
+                            NotificationCenter.default.post(name: .locationSelected, object: location)
+                        }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.caption)
+                                Text("Set as Current Location")
+                                    .font(.caption)
+                                    .fontWeight(.medium)
+                            }
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.blue)
+                            .cornerRadius(6)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Set this location as your current location")
+                    }
+                }
                 
                 // Refresh Button
                 Button(action: {
@@ -155,9 +312,8 @@ struct PrayerTimesView: View {
     
     private func currentPrayerStatusView(_ status: PrayerStatus) -> some View {
         VStack(spacing: 4) {
-            // Only show next prayer if it's not during Isha and next prayer exists and is today
+            // Show next prayer countdown - either today's next prayer or tomorrow's Fajr during Isha
             if let nextPrayer = status.nextPrayer, 
-               status.currentPrayer?.prayerType != .isha,
                Calendar.current.isDateInToday(nextPrayer.time) {
                 HStack {
                     Text("Next: \(nextPrayer.prayerType.displayName)")
@@ -171,10 +327,31 @@ struct PrayerTimesView: View {
                         .fontWeight(.medium)
                         .foregroundColor(.blue)
                     
-                    Text(timeRemainingText(status.timeUntilNext))
+                    Text(timeRemainingText(prayerTimeService.getDynamicTimeRemaining(for: status, prayers: prayers)))
                         .font(.title)
                         .fontWeight(.medium)
                         .foregroundColor(.blue)
+                        .id(timerTick)
+                }
+            } else if status.timeUntilNext > 0 {
+                // During Isha - show countdown to tomorrow's Fajr
+                HStack {
+                    Text("Next: Fajr (Tomorrow)")
+                        .font(.title)
+                        .fontWeight(.medium)
+                    
+                    Spacer()
+
+                    Text("in")
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                        .foregroundColor(.blue)
+                    
+                    Text(timeRemainingText(prayerTimeService.getDynamicTimeRemaining(for: status, prayers: prayers)))
+                        .font(.title)
+                        .fontWeight(.medium)
+                        .foregroundColor(.blue)
+                        .id(timerTick)
                 }
             } else if let currentPrayer = status.currentPrayer {
                 HStack {
@@ -185,10 +362,11 @@ struct PrayerTimesView: View {
                     Spacer()
                     
                     if status.timeUntilCurrentEnds > 0 {
-                        Text("Ends in \(timeRemainingText(status.timeUntilCurrentEnds))")
+                        Text("Ends in \(timeRemainingText(calculateTimeRemaining(for: getNextPrayerAfter(status.currentPrayer))))")
                             .font(.title)
                             .fontWeight(.medium)
                             .foregroundColor(.orange)
+                            .id(timerTick)
                     } else {
                         Text("In Progress")
                             .font(.subheadline)
@@ -234,7 +412,9 @@ struct PrayerTimesView: View {
                 PrayerTimeRow(
                     prayer: prayer,
                     isCurrentPrayer: isCurrentPrayer(prayer),
-                    isNextPrayer: isNextPrayer(prayer)
+                    isNextPrayer: isNextPrayer(prayer),
+                    nextPrayer: currentPrayerStatus?.nextPrayer,
+                    allPrayers: prayers
                 ) {
                     togglePrayerCompletion(prayer)
                 }
@@ -245,9 +425,82 @@ struct PrayerTimesView: View {
     
     // MARK: - Actions
     
+    private func updatePrayerInList(_ changedPrayer: Prayer) {
+        // Find and update the specific prayer in our list without reloading everything
+        if let index = prayers.firstIndex(where: { $0.id == changedPrayer.id }) {
+            prayers[index] = changedPrayer
+        }
+    }
+    
+    private func loadPrayerTimesFromCacheFirst(for location: Location) {
+        print("🔍 Checking cache for \(location.displayName)")
+        
+        // Mark that we've attempted to load
+        self.hasAttemptedLoad = true
+        
+        // First check if PrayerTimeService has valid in-memory cache for this location
+        if let cachedPrayers = prayerTimeService.getCachedPrayersIfValid(for: location) {
+            let todaysPrayers = prayerTimeService.getTodaysPrayers(from: cachedPrayers)
+            
+            if !todaysPrayers.isEmpty {
+                self.prayers = todaysPrayers.sorted { $0.time < $1.time }
+                self.isLoading = false
+                
+                // Calculate status locally without async calls
+                let sortedPrayers = todaysPrayers.sorted { $0.time < $1.time }
+                let (currentPrayer, nextPrayer) = prayerTimeService.getCurrentPrayerPeriod(from: sortedPrayers)
+                
+                var timeUntilNext: TimeInterval = 0
+                if let nextPrayer = nextPrayer {
+                    timeUntilNext = max(0, nextPrayer.time.timeIntervalSince(Date()))
+                }
+                
+                self.currentPrayerStatus = PrayerStatus(
+                    currentPrayer: currentPrayer,
+                    nextPrayer: nextPrayer,
+                    timeUntilNext: timeUntilNext,
+                    timeUntilCurrentEnds: timeUntilNext,
+                    allPrayers: sortedPrayers
+                )
+                self.lastStatusUpdate = Date()
+                
+                print("✅ Used in-memory cache for \(location.displayName)")
+                return
+            }
+        }
+        
+        // Fallback: Try SwiftData cache
+        do {
+            let cacheManager = CacheManager.shared
+            if try cacheManager.hasCachedDailyPrayers(for: location.id, date: Date(), in: modelContext),
+               let cachedPrayers = try cacheManager.getCachedDailyPrayers(for: location.id, date: Date(), in: modelContext),
+               !cachedPrayers.isEmpty {
+                
+                let todaysPrayers = prayerTimeService.getTodaysPrayers(from: cachedPrayers)
+                self.prayers = todaysPrayers.sorted { $0.time < $1.time }
+                self.isLoading = false
+                
+                print("✅ Used SwiftData cache for \(location.displayName)")
+                
+                // Update status in background to avoid blocking
+                Task {
+                    await updateCurrentPrayerStatus(force: true)
+                }
+                return
+            }
+        } catch {
+            print("❌ Cache check failed: \(error.localizedDescription)")
+        }
+        
+        // Last resort: full load
+        print("⚠️ No cache found, loading fresh data for \(location.displayName)")
+        loadPrayerTimes(for: location)
+    }
+    
     private func loadPrayerTimes(for location: Location, forceRefresh: Bool = false) {
         Task {
             await MainActor.run {
+                hasAttemptedLoad = true
                 isLoading = true
                 errorMessage = nil
             }
@@ -293,6 +546,17 @@ struct PrayerTimesView: View {
     }
     
     private func updateTimerDisplay() {
+        // Update timer tick to trigger view refresh
+        timerTick = Date()
+        print("⏰ Timer tick updated (focused: \(isWindowFocused))")
+        
+        // Check if we need to adjust timer frequency
+        let currentInterval = refreshTimer?.timeInterval ?? 1.0
+        let optimalInterval = getOptimalUpdateInterval()
+        if abs(optimalInterval - currentInterval) > 0.1 {
+            restartTimerWithInterval(optimalInterval)
+        }
+        
         // Force status update every 30 seconds or if we don't have status yet
         if currentPrayerStatus == nil || Date().timeIntervalSince(lastStatusUpdate) >= 30 {
             updateCurrentPrayerStatus(force: true)
@@ -323,21 +587,42 @@ struct PrayerTimesView: View {
     }
     
     private func timeRemainingText(_ timeInterval: TimeInterval) -> String {
-        let hours = Int(timeInterval) / 3600
-        let minutes = Int(timeInterval) % 3600 / 60
-        let seconds = Int(timeInterval) % 60
+        // Calculate remaining time dynamically based on current time
+        let remaining = max(0, timeInterval)
+        let hours = Int(remaining) / 3600
+        let minutes = Int(remaining) % 3600 / 60
+        let seconds = Int(remaining) % 60
         
         if hours > 0 {
-            return "\(hours)h \(minutes)m"
-        } else if timeInterval >= 3600 { // 60 minutes or more
-            return "\(minutes)m"
-        } else {
-            // Under 60 minutes, show seconds
+            return "\(hours)h \(minutes)m \(seconds)s"
+        } else if remaining >= 60 {
             return "\(minutes)m \(seconds)s"
+        } else {
+            return "\(seconds)s"
         }
     }
     
     // MARK: - Helper Methods
+    
+    private func calculateTimeRemaining(for prayer: Prayer?) -> TimeInterval {
+        guard let prayer = prayer else { return 0 }
+        return max(0, prayer.time.timeIntervalSince(Date()))
+    }
+    
+    
+    
+    private func getNextPrayerAfter(_ currentPrayer: Prayer?) -> Prayer? {
+        guard let current = currentPrayer else { return nil }
+        
+        // Find the next prayer in today's list
+        let sortedPrayers = prayers.sorted { $0.time < $1.time }
+        if let currentIndex = sortedPrayers.firstIndex(where: { $0.prayerType == current.prayerType }),
+           currentIndex + 1 < sortedPrayers.count {
+            return sortedPrayers[currentIndex + 1]
+        }
+        
+        return nil
+    }
     
     private func isCurrentPrayer(_ prayer: Prayer) -> Bool {
         guard let currentPrayer = currentPrayerStatus?.currentPrayer else { return false }
@@ -365,16 +650,65 @@ struct PrayerTimesView: View {
     // MARK: - Timer Management
     
     private func startRefreshTimer() {
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-            Task { @MainActor in
-                updateTimerDisplay()
-            }
-        }
+        restartTimerWithOptimalInterval()
     }
     
     private func stopRefreshTimer() {
         refreshTimer?.invalidate()
         refreshTimer = nil
+    }
+    
+    private func getTimerInterval() -> TimeInterval {
+        guard let status = currentPrayerStatus else { 
+            print("🔍 getTimerInterval: No status, returning 1.0")
+            return 1.0 
+        }
+        
+        // Get the shortest time remaining that we need to display using centralized calculation
+        let timeToNext = prayerTimeService.getDynamicTimeRemaining(for: status, prayers: prayers)
+        let timeToCurrent = status.currentPrayer != nil ? calculateTimeRemaining(for: getNextPrayerAfter(status.currentPrayer)) : 0
+        
+        let shortestTime = min(timeToNext > 0 ? timeToNext : Double.infinity, 
+                              timeToCurrent > 0 ? timeToCurrent : Double.infinity)
+        
+        print("🔍 getTimerInterval: focused=\(isWindowFocused), timeToNext=\(timeToNext), shortestTime=\(shortestTime)")
+        
+        // Optimize based on window focus and time remaining
+        if !isWindowFocused {
+            // When window is not focused, update less frequently to save resources
+            print("🔍 getTimerInterval: Not focused, returning 60.0")
+            return 60.0 // Update every minute when not focused
+        } else if shortestTime < 3600 { // Less than 60 minutes and focused
+            print("🔍 getTimerInterval: Focused and < 1 hour, returning 1.0")
+            return 1.0 // Update every second to show seconds
+        } else {
+            print("🔍 getTimerInterval: Focused but > 1 hour, returning 60.0")
+            return 60.0 // Update every minute when only showing hours/minutes
+        }
+    }
+    
+    private func getOptimalUpdateInterval() -> TimeInterval {
+        return getTimerInterval()
+    }
+    
+    private func restartTimerWithInterval(_ interval: TimeInterval) {
+        print("🔄 Invalidating old timer and creating new one with interval: \(interval)s")
+        refreshTimer?.invalidate()
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { _ in
+            DispatchQueue.main.async {
+                print("📍 Timer fired with interval: \(interval)s at \(Date())")
+                // Since this is a struct, we need to trigger the timer through a different mechanism
+                // Let's use a notification instead
+                NotificationCenter.default.post(name: .timerUpdate, object: ["interval": interval])
+            }
+        }
+        print("✅ New timer created with interval: \(interval)s")
+    }
+    
+    private func restartTimerWithOptimalInterval() {
+        let optimalInterval = getOptimalUpdateInterval()
+        print("🔄 Restarting timer with optimal interval: \(optimalInterval)s (focused: \(isWindowFocused))")
+        restartTimerWithInterval(optimalInterval)
     }
 }
 
@@ -384,6 +718,8 @@ struct PrayerTimeRow: View {
     let prayer: Prayer
     let isCurrentPrayer: Bool
     let isNextPrayer: Bool
+    let nextPrayer: Prayer?
+    let allPrayers: [Prayer]
     let onCompletionToggle: () -> Void
     
     @State private var isHovered = false
@@ -398,11 +734,12 @@ struct PrayerTimeRow: View {
     }
     
     private var isPrayerTimePassed: Bool {
-        prayer.time < Date()
+        // Use the same visual state logic to determine if prayer is missed
+        visualState == .missed
     }
     
     private var visualState: PrayerVisualState {
-        completionManager.getVisualState(for: prayer)
+        completionManager.getVisualState(for: prayer, nextPrayer: nextPrayer, allPrayers: allPrayers)
     }
     
     var body: some View {
@@ -493,23 +830,6 @@ struct PrayerTimeRow: View {
                 .font(.title2)
                 .foregroundColor(iconColor)
             
-            // Completion overlay
-            if prayer.isCompleted {
-                Circle()
-                    .fill(Color.green.opacity(0.2))
-                    .frame(width: 40, height: 40)
-                
-                Image(systemName: "checkmark")
-                    .font(.caption)
-                    .foregroundColor(.green)
-                    .fontWeight(.bold)
-                    .offset(x: 12, y: -12)
-                    .background(
-                        Circle()
-                            .fill(Color.green)
-                            .frame(width: 16, height: 16)
-                    )
-            }
         }
     }
     
@@ -553,7 +873,7 @@ struct PrayerTimeRow: View {
                         .transition(.opacity.combined(with: .scale))
                 }
             }
-            .frame(minWidth: 0)
+            .frame(minWidth: 40)
             .padding(.horizontal, isHovered ? 8 : 4)
             .padding(.vertical, 4)
             .background(
@@ -658,6 +978,6 @@ struct PrayerTimeRow: View {
 }
 
 #Preview {
-    PrayerTimesView(selectedLocation: nil)
+    PrayerTimesView(selectedLocation: nil, isCurrentLocation: false)
         .modelContainer(for: [Location.self, Prayer.self])
 }

@@ -122,25 +122,34 @@ class LocationService: NSObject, LocationServiceProtocol {
     // MARK: - Current Location
     
     func getCurrentLocation() async throws -> Location {
-        // Check location services
-        guard CLLocationManager.locationServicesEnabled() else {
-            throw LocationError.serviceDisabled
+        do {
+            // Check location services
+            guard CLLocationManager.locationServicesEnabled() else {
+                let error = LocationError.serviceDisabled
+                ErrorLogger.shared.logLocationError(error, action: "getCurrentLocation")
+                throw error
+            }
+            
+            // Check permission
+            guard locationManager.authorizationStatus == .authorized || 
+                  locationManager.authorizationStatus == .authorizedAlways else {
+                let error = LocationError.permissionDenied
+                ErrorLogger.shared.logLocationError(error, action: "getCurrentLocation")
+                throw error
+            }
+            
+            // Get current location with timeout
+            let clLocation = try await getCurrentCLLocation()
+            
+            // Convert to our Location model using reverse geocoding
+            return try await reverseGeocode(
+                latitude: clLocation.coordinate.latitude,
+                longitude: clLocation.coordinate.longitude
+            )
+        } catch {
+            ErrorLogger.shared.logLocationError(error, action: "getCurrentLocation")
+            throw error
         }
-        
-        // Check permission
-        guard locationManager.authorizationStatus == .authorized || 
-              locationManager.authorizationStatus == .authorizedAlways else {
-            throw LocationError.permissionDenied
-        }
-        
-        // Get current location with timeout
-        let clLocation = try await getCurrentCLLocation()
-        
-        // Convert to our Location model using reverse geocoding
-        return try await reverseGeocode(
-            latitude: clLocation.coordinate.latitude,
-            longitude: clLocation.coordinate.longitude
-        )
     }
     
     private func getCurrentCLLocation() async throws -> CLLocation {
@@ -215,12 +224,15 @@ class LocationService: NSObject, LocationServiceProtocol {
             if locations.isEmpty {
                 print("⚠️ No locations were successfully converted for query: '\(query)'")
                 print("📊 API returned \(response.results.count) results")
-                throw LocationError.searchFailed(query)
+                let error = LocationError.searchFailed(query)
+                ErrorLogger.shared.logLocationError(error, action: "searchLocations(query: \(query))")
+                throw error
             }
             
             print("✅ Returning \(locations.count) successfully converted locations")
             return locations
         } catch {
+            ErrorLogger.shared.logLocationError(error, action: "searchLocations(query: \(query))")
             if error is DiyanetAPIError {
                 throw LocationError.networkError
             } else {

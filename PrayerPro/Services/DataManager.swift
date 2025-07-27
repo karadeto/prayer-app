@@ -11,6 +11,7 @@ import SwiftData
 @Observable
 class DataManager {
     static let shared = DataManager()
+    private let appStartTime = Date()
     
     private init() {}
     
@@ -78,8 +79,11 @@ class DataManager {
     }
     
     func fetchCompletionsForDate(_ date: Date, in context: ModelContext) throws -> [PrayerCompletion] {
-        // ModelContext in SwiftData doesn't have isInvalidated like Core Data
-        // Instead, we'll catch any potential context issues during fetch
+        // Add early guard to prevent accessing uninitialized context
+        guard Thread.isMainThread else {
+            print("Warning: fetchCompletionsForDate called from background thread")
+            return []
+        }
         
         let calendar = Calendar.current
         guard let startOfDay = calendar.dateInterval(of: .day, for: date)?.start,
@@ -89,6 +93,10 @@ class DataManager {
         }
         
         do {
+            // Test context validity with a simple fetch first
+            let testDescriptor = FetchDescriptor<PrayerCompletion>(predicate: #Predicate { _ in false })
+            _ = try context.fetch(testDescriptor)
+            
             let descriptor = FetchDescriptor<PrayerCompletion>(
                 predicate: #Predicate { completion in
                     completion.date >= startOfDay &&
@@ -99,23 +107,21 @@ class DataManager {
             
             let completions = try context.fetch(descriptor)
             
-            // Validate completions before returning and filter safely
+            // Filter and validate completions safely
             let validCompletions = completions.compactMap { completion -> PrayerCompletion? in
-                // Safe property access with exception handling for SwiftData objects
                 return autoreleasepool {
                     do {
-                        // Use try-catch for property access that might cause EXC_BAD_ACCESS
-                        guard let _ = try? completion.id,
-                              let _ = try? completion.prayerTypeName else {
-                            print("Warning: Completion object properties are inaccessible, skipping")
-                            return nil
-                        }
+                        // Safe property access without try? which was causing issues
+                        // First check if the object is accessible
+                        _ = completion.id
+                        _ = completion.prayerType
+                        _ = completion.date
                         
                         // Only validate if basic property access succeeded
                         try completion.validate()
                         return completion
                     } catch {
-                        print("Warning: Invalid or inaccessible completion found and filtered out: \(error)")
+                        print("Warning: Invalid completion found and filtered out: \(error)")
                         return nil
                     }
                 }
@@ -124,7 +130,17 @@ class DataManager {
             return validCompletions
         } catch {
             print("Error fetching completions for date \(date): \(error)")
+            // Return empty array instead of throwing during startup
+            if isStartupPhase() {
+                print("During startup - returning empty array instead of throwing")
+                return []
+            }
             throw error
         }
+    }
+    
+    private func isStartupPhase() -> Bool {
+        // Check if app has been running for less than 10 seconds
+        return Date().timeIntervalSince(appStartTime) < 10.0
     }
 }

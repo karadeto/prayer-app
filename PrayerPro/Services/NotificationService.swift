@@ -62,7 +62,7 @@ class NotificationManager: ObservableObject {
     @Published var preferences: NotificationPreferences {
         didSet {
             savePreferences()
-            Task {
+            Task { @MainActor in
                 await rescheduleAllNotifications()
             }
         }
@@ -85,7 +85,7 @@ class NotificationManager: ObservableObject {
         setupNotificationCategories()
         
         // Check initial permission status
-        Task {
+        Task { @MainActor in
             await updatePermissionStatus()
         }
     }
@@ -149,6 +149,11 @@ class NotificationManager: ObservableObject {
             return granted
         } catch {
             print("🔔 Notification permission error: \(error)")
+            ErrorLogger.shared.log(.notificationPermissionDenied, context: ErrorContext(
+                error: .notificationPermissionDenied,
+                userAction: "requestNotificationPermission",
+                additionalInfo: ["underlyingError": error.localizedDescription]
+            ))
             await updatePermissionStatus()
             return false
         }
@@ -269,6 +274,14 @@ class NotificationManager: ObservableObject {
             try await notificationCenter.add(request)
         } catch {
             print("Failed to schedule notification for \(prayer.prayerType.displayName): \(error)")
+            ErrorLogger.shared.log(.notificationSchedulingFailed, context: ErrorContext(
+                error: .notificationSchedulingFailed,
+                userAction: "scheduleNotification",
+                additionalInfo: [
+                    "prayerType": prayer.prayerType.rawValue,
+                    "underlyingError": error.localizedDescription
+                ]
+            ))
         }
     }
     

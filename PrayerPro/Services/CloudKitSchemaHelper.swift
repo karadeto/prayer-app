@@ -30,13 +30,19 @@ class CloudKitSchemaHelper {
         let container = CKContainer.default()
         let database = container.privateCloudDatabase
         
-        // Test query to verify PrayerCompletion record type exists
-        // Use a simple predicate that CloudKit can handle
-        let query = CKQuery(recordType: RecordTypes.prayerCompletion, predicate: NSPredicate(value: true))
+        // Instead of querying, try to create and immediately delete a test record
+        // This verifies the schema exists without needing queryable fields
+        let testRecord = createSampleRecord()
         
         do {
-            let (results, _) = try await database.records(matching: query, resultsLimit: 1)
+            // Try to save the test record
+            let savedRecord = try await database.save(testRecord)
             print("✅ CloudKit schema verified successfully")
+            
+            // Immediately delete the test record to clean up
+            try await database.deleteRecord(withID: savedRecord.recordID)
+            print("🧹 Test record cleaned up")
+            
         } catch let error as CKError {
             switch error.code {
             case .unknownItem:
@@ -48,6 +54,11 @@ class CloudKitSchemaHelper {
                 print("   - \(PrayerCompletionFields.completedAt): Date/Time")
                 print("   - \(PrayerCompletionFields.locationId): String")
                 print("   - \(PrayerCompletionFields.createdAt): Date/Time")
+                throw CloudKitSchemaError.schemaNotConfigured
+            case .invalidArguments, .constraintViolation:
+                print("❌ CloudKit schema validation failed: Missing or incorrectly configured fields")
+                print("📋 Please check that all required fields exist with correct types")
+                printSchemaInstructions()
                 throw CloudKitSchemaError.schemaNotConfigured
             default:
                 print("❌ CloudKit schema verification failed: \(error.localizedDescription)")
@@ -87,21 +98,30 @@ class CloudKitSchemaHelper {
         
            Field Name: \(PrayerCompletionFields.prayerType)
            Type: String
+           Queryable: ✅ (recommended)
            
            Field Name: \(PrayerCompletionFields.date)
            Type: Date/Time
+           Queryable: ✅ (required for date range queries)
            
            Field Name: \(PrayerCompletionFields.completedAt)
            Type: Date/Time
+           Queryable: ✅ (recommended)
            
            Field Name: \(PrayerCompletionFields.locationId)
            Type: String
+           Queryable: ✅ (recommended)
            
            Field Name: \(PrayerCompletionFields.createdAt)
            Type: Date/Time
+           Queryable: ✅ (recommended)
         
-        6. Save the schema
-        7. Deploy to Production Environment
+        6. IMPORTANT: Mark the 'date' field as Queryable (required for syncing)
+        7. Save the schema
+        8. Deploy to Production Environment
+        
+        Note: If you get "Field not marked queryable" errors, ensure the 'date' field
+        is marked as queryable in the CloudKit Dashboard.
         
         """)
     }

@@ -281,7 +281,7 @@ extension AnnualPrayerDataResponse {
                 }
                 
                 let prayer = try Prayer(
-                    prayerType: prayerType,
+                    uncheckedTime: prayerType,
                     time: prayerTime,
                     locationId: locationUUID,
                     isCompleted: prayerResponse.completed ?? false

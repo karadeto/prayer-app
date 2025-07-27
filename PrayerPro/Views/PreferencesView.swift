@@ -9,72 +9,46 @@ import SwiftUI
 import CloudKit
 
 struct PreferencesView: View {
-    @StateObject private var preferencesManager = PreferencesManager.shared
-    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var preferencesManager = PreferencesManager.shared
     
     @State private var selectedTab: PreferencesTab = .statusBar
     
     var body: some View {
-        VStack(spacing: 0) {
-            // Tab Bar
-            tabBar
+        TabView(selection: $selectedTab) {
+            StatusBarPreferencesView()
+                .tabItem {
+                    Label("Status Bar", systemImage: "menubar.rectangle")
+                }
+                .tag(PreferencesTab.statusBar)
             
-            Divider()
+            GeneralPreferencesView()
+                .tabItem {
+                    Label("General", systemImage: "gear")
+                }
+                .tag(PreferencesTab.general)
             
-            // Content
-            TabView(selection: $selectedTab) {
-                StatusBarPreferencesView()
-                    .tabItem {
-                        Label("Status Bar", systemImage: "menubar.rectangle")
-                    }
-                    .tag(PreferencesTab.statusBar)
-                
-                GeneralPreferencesView()
-                    .tabItem {
-                        Label("General", systemImage: "gear")
-                    }
-                    .tag(PreferencesTab.general)
-                
-                NotificationPreferencesViewImpl()
-                    .tabItem {
-                        Label("Notifications", systemImage: "bell")
-                    }
-                    .tag(PreferencesTab.notifications)
-                
-                iCloudSyncPreferencesView()
-                    .tabItem {
-                        Label("iCloud Sync", systemImage: "icloud")
-                    }
-                    .tag(PreferencesTab.iCloudSync)
-            }
-            .tabViewStyle(.automatic)
+            NotificationPreferencesViewImpl()
+                .tabItem {
+                    Label("Notifications", systemImage: "bell")
+                }
+                .tag(PreferencesTab.notifications)
+            
+            iCloudSyncPreferencesView()
+                .tabItem {
+                    Label("iCloud Sync", systemImage: "icloud")
+                }
+                .tag(PreferencesTab.iCloudSync)
         }
+        .tabViewStyle(.automatic)
         .frame(width: 500, height: 400)
-        .background(Color(NSColor.windowBackgroundColor))
-    }
-    
-    private var tabBar: some View {
-        HStack {
-            Text("Preferences")
-                .font(.title2)
-                .fontWeight(.semibold)
-            
-            Spacer()
-            
-            Button("Done") {
-                dismiss()
-            }
-            .buttonStyle(.borderedProminent)
-        }
-        .padding()
     }
 }
 
 // MARK: - Status Bar Preferences View
 
 struct StatusBarPreferencesView: View {
-    @StateObject private var preferencesManager = PreferencesManager.shared
-    @StateObject private var statusBarController = StatusBarController.shared
+    @ObservedObject private var preferencesManager = PreferencesManager.shared
+    @ObservedObject private var statusBarController = StatusBarController.shared
     
     var body: some View {
         ScrollView {
@@ -286,7 +260,7 @@ struct StatusBarPreferencesView: View {
 // MARK: - General Preferences View
 
 struct GeneralPreferencesView: View {
-    @StateObject private var preferencesManager = PreferencesManager.shared
+    @ObservedObject private var preferencesManager = PreferencesManager.shared
     
     var body: some View {
         ScrollView {
@@ -316,12 +290,13 @@ struct GeneralPreferencesView: View {
 
 // MARK: - Notification Preferences View Implementation
 struct NotificationPreferencesViewImpl: View {
-    @StateObject private var preferencesManager = PreferencesManager.shared
-    @StateObject private var notificationManager = NotificationManager.shared
+    @ObservedObject private var preferencesManager = PreferencesManager.shared
+    @ObservedObject private var notificationManager = NotificationManager.shared
     @State private var showingLocationPicker = false
     @State private var availableLocations: [Location] = []
     @State private var isLoadingLocations = false
     @State private var isRequestingPermission = false
+    @State private var notificationObserver: NSObjectProtocol?
     
     var body: some View {
         ScrollView {
@@ -370,13 +345,27 @@ struct NotificationPreferencesViewImpl: View {
             .padding()
         }
         .onAppear {
-            Task {
+            Task { @MainActor in
                 await notificationManager.updatePermissionStatus()
             }
+            
+            // Setup notification observer with weak self pattern
+            notificationObserver = NotificationCenter.default.addObserver(
+                forName: .notificationPermissionChanged,
+                object: nil,
+                queue: .main
+            ) { [weak notificationManager] _ in
+                guard let notificationManager = notificationManager else { return }
+                Task { @MainActor in
+                    await notificationManager.updatePermissionStatus()
+                }
+            }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .notificationPermissionChanged)) { _ in
-            Task {
-                await notificationManager.updatePermissionStatus()
+        .onDisappear {
+            // Clean up notification observer
+            if let observer = notificationObserver {
+                NotificationCenter.default.removeObserver(observer)
+                notificationObserver = nil
             }
         }
     }
@@ -718,11 +707,12 @@ enum PreferencesTab: String, CaseIterable {
 // MARK: - iCloud Sync Preferences View
 
 struct iCloudSyncPreferencesView: View {
-    @StateObject private var syncService = iCloudSyncService.shared
+    @ObservedObject private var syncService = iCloudSyncService.shared
     @State private var accountStatus: CKAccountStatus = .couldNotDetermine
     @State private var isCheckingStatus = false
     @State private var lastSyncError: String?
     @State private var showingSchemaInstructions = false
+    @State private var currentTask: Task<Void, Never>?
     
     var body: some View {
         ScrollView {
@@ -764,6 +754,11 @@ struct iCloudSyncPreferencesView: View {
         }
         .onAppear {
             checkAccountStatus()
+        }
+        .onDisappear {
+            // Cancel any running tasks
+            currentTask?.cancel()
+            currentTask = nil
         }
         .sheet(isPresented: $showingSchemaInstructions) {
             SchemaInstructionsView()
@@ -1031,15 +1026,22 @@ struct iCloudSyncPreferencesView: View {
     // MARK: - Helper Methods
     
     private func checkAccountStatus() {
+        // Cancel existing task
+        currentTask?.cancel()
+        
         isCheckingStatus = true
-        Task {
+        currentTask = Task {
             do {
                 let status = try await syncService.checkAccountStatus()
+                guard !Task.isCancelled else { return }
+                
                 await MainActor.run {
                     self.accountStatus = status
                     self.isCheckingStatus = false
                 }
             } catch {
+                guard !Task.isCancelled else { return }
+                
                 await MainActor.run {
                     self.accountStatus = .couldNotDetermine
                     self.isCheckingStatus = false

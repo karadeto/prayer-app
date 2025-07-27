@@ -151,10 +151,6 @@ struct LocationSearchView: View {
         List(searchResults) { location in
             LocationSearchRow(
                 location: location,
-                onSelect: { selectedLocation in
-                    onLocationSelected(selectedLocation)
-                    dismiss()
-                },
                 onAddToFavorites: { locationToAdd in
                     Task {
                         await addToFavorites(locationToAdd)
@@ -223,7 +219,6 @@ struct LocationSearchView: View {
 
 struct LocationSearchRow: View {
     let location: Location
-    let onSelect: (Location) -> Void
     let onAddToFavorites: (Location) -> Void
     
     @State private var isAddingToFavorites = false
@@ -249,36 +244,29 @@ struct LocationSearchRow: View {
             
             Spacer()
             
-            HStack(spacing: 8) {
-                // Add to Favorites Button
-                Button(action: {
-                    isAddingToFavorites = true
-                    onAddToFavorites(location)
-                    
-                    // Reset button state after a delay
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                        isAddingToFavorites = false
-                    }
-                }) {
-                    Image(systemName: isAddingToFavorites ? "checkmark" : "heart")
-                        .foregroundColor(isAddingToFavorites ? .green : .secondary)
-                }
-                .buttonStyle(.plain)
-                .disabled(isAddingToFavorites)
+            // Add to Favorites Button
+            Button(action: {
+                isAddingToFavorites = true
+                onAddToFavorites(location)
                 
-                // Select Button
-                Button("Select") {
-                    onSelect(location)
+                // Reset button state after a delay
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    isAddingToFavorites = false
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
+            }) {
+                HStack(spacing: 4) {
+                    Image(systemName: isAddingToFavorites ? "checkmark" : "plus")
+                        .foregroundColor(isAddingToFavorites ? .green : .blue)
+                    Text(isAddingToFavorites ? "Added" : "Add to Favorites")
+                        .foregroundColor(isAddingToFavorites ? .green : .blue)
+                }
             }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .disabled(isAddingToFavorites)
         }
         .padding(.vertical, 4)
         .contentShape(Rectangle())
-        .onTapGesture {
-            onSelect(location)
-        }
     }
 }
 

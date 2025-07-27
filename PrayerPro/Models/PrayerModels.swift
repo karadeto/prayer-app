@@ -23,7 +23,7 @@ enum ValidationError: LocalizedError {
         case .invalidCoordinates:
             return "Invalid coordinates: latitude must be between -90 and 90, longitude between -180 and 180"
         case .invalidPrayerTime:
-            return "Invalid prayer time: time cannot be in the future beyond 24 hours"
+            return "Invalid prayer time: time cannot be in the future beyond 48 hours"
         case .invalidLocationName:
             return "Invalid location name: name cannot be empty"
         case .invalidDiyanetId:
@@ -60,13 +60,13 @@ enum PrayerType: String, CaseIterable, Codable {
 // MARK: - Prayer Model
 @Model
 final class Prayer: Codable {
-    @Attribute(.unique) var id: UUID
-    var name: String
-    var time: Date
-    var locationId: UUID
-    var isCompleted: Bool
-    var completedAt: Date?
-    var createdAt: Date
+    var id: UUID = UUID()
+    var name: String = ""
+    var time: Date = Date.now
+    var locationId: UUID = UUID()
+    var isCompleted: Bool = false
+    var completedAt: Date? = nil
+    var createdAt: Date = Date.now
     
     // Computed property for prayer type
     var prayerType: PrayerType {
@@ -120,12 +120,28 @@ final class Prayer: Codable {
         self.createdAt = Date()
     }
     
+    /// Internal initializer for annual data fetching that bypasses time validation
+    internal init(uncheckedTime prayerType: PrayerType, time: Date, locationId: UUID, isCompleted: Bool = false, completedAt: Date? = nil) throws {
+        // Only validate completion date if provided, skip prayer time validation for annual data
+        if let completedAt = completedAt {
+            try Self.validateCompletionDate(completedAt)
+        }
+        
+        self.id = UUID()
+        self.name = prayerType.rawValue
+        self.time = time
+        self.locationId = locationId
+        self.isCompleted = isCompleted
+        self.completedAt = completedAt
+        self.createdAt = Date()
+    }
+    
     // MARK: - Validation Methods
     
-    /// Validates that prayer time is reasonable (not more than 24 hours in the future)
+    /// Validates that prayer time is reasonable (not more than 48 hours in the future, allows for next day prayers)
     static func validatePrayerTime(_ time: Date) throws {
         let now = Date()
-        let maxFutureTime = now.addingTimeInterval(24 * 60 * 60) // 24 hours
+        let maxFutureTime = now.addingTimeInterval(48 * 60 * 60) // 48 hours to allow next day prayers
         
         if time > maxFutureTime {
             throw ValidationError.invalidPrayerTime
@@ -176,17 +192,17 @@ final class Prayer: Codable {
 // MARK: - Location Model
 @Model
 final class Location: Identifiable {
-    @Attribute(.unique) var id: UUID
-    var name: String
-    var city: String
-    var country: String
-    var latitude: Double
-    var longitude: Double
-    var diyanetId: String?
-    var isFavorite: Bool
-    var isGPSLocation: Bool
-    var annualDataCached: Bool
-    var lastUpdated: Date
+    var id: UUID = UUID()
+    var name: String = "No Location"
+    var city: String = "No City"
+    var country: String = "No Country"
+    var latitude: Double = 0
+    var longitude: Double = 0
+    var diyanetId: String? = nil
+    var isFavorite: Bool = false
+    var isGPSLocation: Bool = false
+    var annualDataCached: Bool = false
+    var lastUpdated: Date = Date.now
     
     // Computed property for CLLocationCoordinate2D
     var coordinate: CLLocationCoordinate2D {
@@ -310,12 +326,12 @@ final class Location: Identifiable {
 // MARK: - Prayer Completion Model
 @Model
 final class PrayerCompletion {
-    @Attribute(.unique) var id: UUID
-    var prayerTypeName: String
-    var date: Date
-    var completedAt: Date
-    var locationId: UUID
-    var syncedToiCloud: Bool
+    var id: UUID = UUID()
+    var prayerTypeName: String = ""
+    var date: Date = Date.now
+    var completedAt: Date = Date.now
+    var locationId: UUID = UUID()
+    var syncedToiCloud: Bool = false
     
     // Computed property for prayer type
     var prayerType: PrayerType {

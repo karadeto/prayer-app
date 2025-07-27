@@ -11,9 +11,9 @@ import SwiftData
 struct SidebarView: View {
     @Environment(\.modelContext) private var modelContext
     
-    @State private var selectedLocation: Location?
+    @State private var highlightedLocation: Location?
+    @State private var actualSelectedLocation: Location?
     @State private var gpsLocation: Location?
-    @State private var showingLocationSearch = false
     @State private var showingLocationPermissionAlert = false
     @State private var isLoadingGPS = false
     @State private var errorMessage: String?
@@ -22,15 +22,21 @@ struct SidebarView: View {
     private let locationService = LocationService.shared
     private let favoritesManager = FavoriteLocationsManager.shared
     
-    // Binding to communicate selected location to parent
+    // Binding to communicate location changes to parent
+    let onLocationViewed: (Location?) -> Void
     let onLocationSelected: (Location?) -> Void
+    let onShowLocationSearch: () -> Void
     
-    init(onLocationSelected: @escaping (Location?) -> Void = { _ in }) {
+    init(onLocationViewed: @escaping (Location?) -> Void = { _ in }, 
+         onLocationSelected: @escaping (Location?) -> Void = { _ in },
+         onShowLocationSearch: @escaping () -> Void = { }) {
+        self.onLocationViewed = onLocationViewed
         self.onLocationSelected = onLocationSelected
+        self.onShowLocationSearch = onShowLocationSearch
     }
     
     var body: some View {
-        List(selection: $selectedLocation) {
+        List(selection: $highlightedLocation) {
             // GPS Location Section
             gpsLocationSection
             
@@ -39,18 +45,13 @@ struct SidebarView: View {
         }
         .navigationTitle("Locations")
         .toolbar {
-            ToolbarItem {
+            ToolbarItem(placement: .primaryAction) {
                 Button(action: {
-                    showingLocationSearch = true
+                    onShowLocationSearch()
                 }) {
                     Image(systemName: "plus")
                 }
                 .help("Add new location")
-            }
-        }
-        .sheet(isPresented: $showingLocationSearch) {
-            LocationSearchView { location in
-                selectLocation(location)
             }
         }
         .alert("Location Permission Required", isPresented: $showingLocationPermissionAlert) {
@@ -68,15 +69,15 @@ struct SidebarView: View {
         } message: {
             Text(errorMessage ?? "An unknown error occurred")
         }
-        .onChange(of: selectedLocation) { _, newLocation in
-            onLocationSelected(newLocation)
+        .onChange(of: highlightedLocation) { _, newLocation in
+            // Don't call onLocationSelected here! This is just for highlighting
         }
         .onAppear {
             setupFavoritesManager()
             autoSelectInitialLocation()
         }
         .onReceive(NotificationCenter.default.publisher(for: .refreshPrayerTimes)) { _ in
-            if let location = selectedLocation {
+            if let location = actualSelectedLocation {
                 // Refresh current location data
                 if location.isGPSLocation {
                     loadGPSLocationIfAvailable()
@@ -103,7 +104,8 @@ struct SidebarView: View {
             } else if let gpsLocation = gpsLocation {
                 LocationRow(
                     location: gpsLocation,
-                    isSelected: selectedLocation?.id == gpsLocation.id,
+                    isSelected: highlightedLocation?.id == gpsLocation.id,
+                    isActuallySelected: actualSelectedLocation?.id == gpsLocation.id,
                     showFavoriteButton: false
                 ) {
                     selectLocation(gpsLocation)
@@ -145,14 +147,33 @@ struct SidebarView: View {
                 ForEach(favoritesManager.favoriteLocations) { location in
                     LocationRow(
                         location: location,
-                        isSelected: selectedLocation?.id == location.id,
-                        showFavoriteButton: true,
-                        isFavorite: true
-                    ) {
-                        selectLocation(location)
-                    } onFavoriteToggle: {
-                        Task {
-                            await removeFromFavorites(location)
+                        isSelected: highlightedLocation?.id == location.id,
+                        isActuallySelected: actualSelectedLocation?.id == location.id,
+                        showFavoriteButton: false,
+                        showUseButton: false,
+                        isFavorite: true,
+                        isClickable: true,
+                        onSelect: {
+                            viewLocation(location)
+                        },
+                        onFavoriteToggle: nil,
+                        onUse: nil
+                    )
+                    .contextMenu {
+                        Button(action: {
+                            selectLocation(location)
+                        }) {
+                            Label("Set as Current Location", systemImage: "checkmark.circle")
+                        }
+                        
+                        Divider()
+                        
+                        Button(action: {
+                            Task {
+                                await removeFromFavorites(location)
+                            }
+                        }) {
+                            Label("Delete Location", systemImage: "trash")
                         }
                     }
                 }
@@ -167,8 +188,15 @@ struct SidebarView: View {
     }
     
     private func selectLocation(_ location: Location) {
-        selectedLocation = location
+        highlightedLocation = location
+        actualSelectedLocation = location
         onLocationSelected(location)
+    }
+    
+    private func viewLocation(_ location: Location) {
+        // View location temporarily without making it the current location
+        highlightedLocation = location
+        onLocationViewed(location)
     }
     
     private func requestGPSLocation() {
@@ -264,10 +292,14 @@ struct SidebarView: View {
 struct LocationRow: View {
     let location: Location
     let isSelected: Bool
+    var isActuallySelected: Bool = false
     let showFavoriteButton: Bool
+    var showUseButton: Bool = false
     var isFavorite: Bool = false
+    var isClickable: Bool = true
     let onSelect: () -> Void
     var onFavoriteToggle: (() -> Void)?
+    var onUse: (() -> Void)?
     
     var body: some View {
         HStack {
@@ -292,6 +324,22 @@ struct LocationRow: View {
             
             Spacer()
             
+            // Use Button (for favorites)
+            if showUseButton && !isSelected, let onUse = onUse {
+                Button(action: onUse) {
+                    Text("Use")
+                        .font(.caption)
+                        .fontWeight(.medium)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.blue)
+                        .cornerRadius(4)
+                }
+                .buttonStyle(.plain)
+                .help("Set as current location")
+            }
+            
             // Favorite Button
             if showFavoriteButton, let onFavoriteToggle = onFavoriteToggle {
                 Button(action: onFavoriteToggle) {
@@ -303,7 +351,7 @@ struct LocationRow: View {
             }
             
             // Selection Indicator
-            if isSelected {
+            if isActuallySelected {
                 Image(systemName: "checkmark")
                     .foregroundColor(.blue)
                     .font(.caption)
@@ -312,7 +360,9 @@ struct LocationRow: View {
         .padding(.vertical, 2)
         .contentShape(Rectangle())
         .onTapGesture {
-            onSelect()
+            if isClickable {
+                onSelect()
+            }
         }
         .background(
             RoundedRectangle(cornerRadius: 6)

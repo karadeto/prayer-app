@@ -10,8 +10,10 @@ import SwiftData
 
 struct MainWindowView: View {
     @State private var selectedLocation: Location?
+    @State private var viewedLocation: Location?
     @State private var sidebarVisibility: NavigationSplitViewVisibility = .all
     @State private var selectedTab: MainTab = .prayerTimes
+    @State private var showingLocationSearch = false
     
     @EnvironmentObject private var statusBarController: StatusBarController
     
@@ -29,16 +31,27 @@ struct MainWindowView: View {
     
     var body: some View {
         NavigationSplitView(columnVisibility: $sidebarVisibility) {
-            SidebarView { location in
-                selectedLocation = location
-                // Update status bar widget when location changes
-                statusBarController.updateLocation(location)
-                // Post notification for other components
-                NotificationCenter.default.post(name: .locationSelected, object: location)
-            }
+            SidebarView(
+                onLocationViewed: { location in
+                    // Just view the location temporarily without making it current
+                    viewedLocation = location
+                },
+                onLocationSelected: { location in
+                    // Set as the actual current location
+                    selectedLocation = location
+                    viewedLocation = location
+                    // Update status bar widget when location changes
+                    statusBarController.updateLocation(location)
+                    // Post notification for other components
+                    NotificationCenter.default.post(name: .locationSelected, object: location)
+                },
+                onShowLocationSearch: {
+                    showingLocationSearch = true
+                }
+            )
             .navigationSplitViewColumnWidth(min: 250, ideal: 300, max: 400)
         } detail: {
-            if selectedLocation != nil {
+            if let currentLocation = viewedLocation ?? selectedLocation {
                 VStack(spacing: 0) {
                     // Tab Selector
                     tabSelector
@@ -47,10 +60,13 @@ struct MainWindowView: View {
                     Group {
                         switch selectedTab {
                         case .prayerTimes:
-                            PrayerTimesView(selectedLocation: selectedLocation)
+                            PrayerTimesView(
+                                selectedLocation: currentLocation,
+                                isCurrentLocation: currentLocation.id == selectedLocation?.id
+                            )
                                 .id("prayer-times")
                         case .history:
-                            PrayerCompletionHistoryView(selectedLocation: selectedLocation)
+                            PrayerCompletionHistoryView(selectedLocation: currentLocation)
                                 .id("history")
                         }
                     }
@@ -63,13 +79,18 @@ struct MainWindowView: View {
             }
         }
         .navigationSplitViewStyle(.balanced)
+        .sheet(isPresented: $showingLocationSearch) {
+            LocationSearchView { location in
+                handleNewLocationSelection(location)
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .toggleSidebar)) { _ in
             toggleSidebar()
         }
     }
     
     private var tabSelector: some View {
-        HStack(spacing: 0) {
+        HStack(spacing: 4) {
             ForEach(MainTab.allCases, id: \.self) { tab in
                 Button(action: {
                     selectedTab = tab
@@ -81,14 +102,19 @@ struct MainWindowView: View {
                             .font(.system(size: 14, weight: .medium))
                     }
                     .foregroundColor(selectedTab == tab ? .white : .primary)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, minHeight: 36)
                     .background(
-                        RoundedRectangle(cornerRadius: 6)
+                        RoundedRectangle(cornerRadius: 8)
                             .fill(selectedTab == tab ? Color.blue : Color.clear)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(selectedTab == tab ? Color.clear : Color.gray.opacity(0.3), lineWidth: 1)
+                            )
                     )
+                    .contentShape(RoundedRectangle(cornerRadius: 8))
                 }
                 .buttonStyle(.plain)
+                .frame(maxWidth: .infinity)
             }
             
             Spacer()
@@ -117,6 +143,13 @@ struct MainWindowView: View {
         withAnimation {
             sidebarVisibility = sidebarVisibility == .all ? .detailOnly : .all
         }
+    }
+    
+    private func handleNewLocationSelection(_ location: Location) {
+        selectedLocation = location
+        viewedLocation = location
+        statusBarController.updateLocation(location)
+        NotificationCenter.default.post(name: .locationSelected, object: location)
     }
 }
 
