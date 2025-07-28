@@ -211,11 +211,7 @@ final class Location: Identifiable {
     
     // Computed property for display name
     var displayName: String {
-        if isGPSLocation {
-            // For GPS locations, show the actual Diyanet location name instead of generic "Current Location"
-            return name
-        }
-        return "\(name), \(city)"
+        return name
     }
     
     init(id: UUID = UUID(), name: String, city: String, country: String, latitude: Double, longitude: Double, diyanetId: String? = nil, isFavorite: Bool = false, isGPSLocation: Bool = false) throws {

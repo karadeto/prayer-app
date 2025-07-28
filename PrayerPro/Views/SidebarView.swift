@@ -99,6 +99,8 @@ struct SidebarView: View {
                         .scaleEffect(0.8)
                     Text("Getting location...")
                         .foregroundColor(.secondary)
+                        .frame(width: 180, alignment: .leading)
+                        .clipped()
                     Spacer()
                 }
             } else if let gpsLocation = gpsLocation {
@@ -116,6 +118,8 @@ struct SidebarView: View {
                         Image(systemName: "location")
                             .foregroundColor(.blue)
                         Text("Use Current Location")
+                            .frame(width: 150, alignment: .leading)
+                            .clipped()
                         Spacer()
                         Image(systemName: "chevron.right")
                             .font(.caption)
@@ -137,12 +141,16 @@ struct SidebarView: View {
                         .scaleEffect(0.8)
                     Text("Loading favorites...")
                         .foregroundColor(.secondary)
+                        .frame(width: 180, alignment: .leading)
+                        .clipped()
                     Spacer()
                 }
             } else if favoritesManager.favoriteLocations.isEmpty {
                 Text("No favorite locations")
                     .foregroundColor(.secondary)
                     .font(.subheadline)
+                    .frame(width: 180, alignment: .leading)
+                    .clipped()
             } else {
                 ForEach(favoritesManager.favoriteLocations) { location in
                     LocationRow(
@@ -313,12 +321,16 @@ struct LocationRow: View {
                 Text(location.displayName)
                     .font(.headline)
                     .lineLimit(1)
+                    .frame(width: 180, alignment: .leading)
+                    .clipped()
                 
                 if !location.isGPSLocation {
                     Text(location.country)
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .lineLimit(1)
+                        .frame(width: 180, alignment: .leading)
+                        .clipped()
                 }
             }
             
